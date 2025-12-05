@@ -20,10 +20,13 @@ from skimage.measure import label as cc_label, regionprops
 from scipy.ndimage import (
     binary_fill_holes,
     binary_dilation,
+    binary_erosion,
     binary_closing,
 )  
 from skimage.morphology import disk  
+from skimage.measure import find_contours
 import pandas as pd
+import time
 
 
 os.makedirs('results/temp', exist_ok=True)
@@ -31,9 +34,30 @@ os.makedirs('results/gifs', exist_ok=True)
 os.makedirs('results/masks', exist_ok=True)
 os.makedirs('results/edited_sax_df', exist_ok=True)
 
-GIF_H = GIF_W = 150
-DISPLAY_H = DISPLAY_W = 500
-OVERLAY_COLORS = [(0,0,0,0), (0,0,255,128), (255,0,0,128)]
+GIF_W = 150
+DISPLAY_H = DISPLAY_W = 400
+BACKGROUND_COLOR = (0, 0, 0, 0)
+LV_MYO_COLOR = (0, 255, 255, 50) # Blue
+LV_COLOR = (255, 10, 10, 50)      # Red
+
+background_idx = 0
+lv_myo_idx = 1
+lv_idx = 2
+
+channels = [lv_myo_idx, lv_idx]
+
+BRUSH_LABELS = {
+    lv_myo_idx: 'LV Myocardium 🔵',
+    lv_idx: 'LV Blood Pool 🔴',
+}
+
+
+OVERLAY_COLORS = {
+    background_idx: BACKGROUND_COLOR,
+    lv_myo_idx: LV_MYO_COLOR,
+    lv_idx: LV_COLOR,
+}
+
 
 preprocessed_gif_path = f'results/temp/preprocessed.gif'
 edv_esv_gif_path = f'results/temp/edv_esv.gif'
@@ -84,7 +108,8 @@ def initialize_app(data_path, sax_series_uid, preprocess=True):
     # -----------------------------
     volume = np.sum(raw_mask[...,-1], axis=(0,1,2))
     raw_dia_idx = int(np.argmax(volume))
-    raw_sys_idx = int(np.argmin(volume))
+    raw_sys_idx = np.where(volume != 0)[0][np.argmin(volume[volume != 0])]
+
 
     # Compute raw metrics
     raw_volume, raw_masses, raw_edv, raw_esv, raw_sv, raw_ef, raw_mass = calculate_sax_metrics(
@@ -126,7 +151,7 @@ def initialize_app(data_path, sax_series_uid, preprocess=True):
 
         has_masks = np.where(np.sum(preprocessed_mask[...,-1], axis = (0,1,3))>0)[0]
         mid_slice = len(has_masks)//2
-        make_video(preprocessed_image[:,:,has_masks[mid_slice-3:mid_slice+3],:], preprocessed_mask[:,:,has_masks[mid_slice-3:mid_slice+3],:, :], save_file=edv_esv_gif_path)
+        make_video(preprocessed_image[:,:,has_masks[mid_slice-3:mid_slice+3],:], preprocessed_mask[:,:,has_masks[mid_slice-3:mid_slice+3],:, :] * 0, save_file=edv_esv_gif_path)
         
         gif = Image.open(edv_esv_gif_path)
 
@@ -178,39 +203,39 @@ def load_nii(nii_path):
     return data
 
 
-def thicken_close_and_fill(
-    strokes: np.ndarray,
-    dilate_iter: int = 1,
-    close_radius: int = 2,
-) -> np.ndarray:
-    """
-    Helper for LV contour editing:
-
-    1. Thicken strokes (binary_dilation) so small gaps shrink.
-    2. Binary closing (dilate+erode) to bridge breaks.
-    3. Fill interior (binary_fill_holes).
-
-    Input/Output: boolean mask.
-    """
+def thicken_close_and_fill(strokes):
     if strokes is None or not strokes.any():
         return strokes
 
-    # Small 3x3-ish disk to thicken the strokes
-    selem_dilate = disk(1)
-    # Slightly larger disk for closing, to bridge small end-point gaps
-    selem_close = disk(close_radius)
+    # Dilate slightly for better contour detection
+    dilated = binary_dilation(strokes)
+    contours = find_contours(dilated, 0.5)
 
-    thick = binary_dilation(
-        strokes,
-        structure=selem_dilate,
-        iterations=dilate_iter,
-    )
-    closed = binary_closing(
-        thick,
-        structure=selem_close,
-    )
-    filled = binary_fill_holes(closed)
-    return filled
+    has_ring = False
+    for i, c1 in enumerate(contours):
+        for j, c2 in enumerate(contours):
+            if i == j:
+                continue
+            # Simple check: if all points of c2 are inside c1 bounding box
+            y1, x1 = c1[:, 0], c1[:, 1]
+            y2, x2 = c2[:, 0], c2[:, 1]
+            if (y2.min() > y1.min() and y2.max() < y1.max() and
+                x2.min() > x1.min() and x2.max() < x1.max()):
+                has_ring = True
+                break
+        if has_ring:
+            break
+
+    if has_ring:
+        selem_dilate = disk(1)
+        selem_close = disk(2)
+        closed = binary_dilation(strokes, iterations = 3, structure = selem_dilate)
+        filled = binary_fill_holes(closed, structure = selem_close)
+        filled = binary_erosion(filled, iterations = 3, structure = selem_dilate)
+        return filled
+
+    else:
+        return strokes
 
 
 def make_video(image, mask, save_file, scale=1):
@@ -221,11 +246,9 @@ def make_video(image, mask, save_file, scale=1):
     grid_cols = (position + grid_rows - 1) // grid_rows
 
     H, W = image.shape[:2]
+    GIF_H = H*GIF_W/W
     H_scaled, W_scaled = round(GIF_H * scale), round(GIF_W * scale)
-
     img_min, img_max = np.min(image), np.max(image)
-
-
 
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", int(18 * scale))
@@ -254,7 +277,7 @@ def make_video(image, mask, save_file, scale=1):
             img_pil = img_pil.resize((W_scaled, H_scaled), resample=Image.NEAREST)
 
             overlay = np.zeros((H, W, 4), dtype=np.uint8)
-            for ch in [1, 2]:
+            for ch in channels:
                 ch_mask = mask[:,:,idx,t,ch]
                 if np.any(ch_mask):
                     color = np.array(OVERLAY_COLORS[ch], dtype=np.uint8)
@@ -332,13 +355,10 @@ def find_crop_box(mask, crop_factor):
 
 
 
-
-
-
 def calculate_sax_metrics(mask, pixelspacing, thickness, dia_idx, sys_idx):
     voxel_size = pixelspacing ** 2 * thickness / 1000
-    volume = np.sum(mask[..., -1], axis=(0,1,2)) * voxel_size
-    masses = np.sum(mask[..., -2], axis=(0,1,2)) * voxel_size * 1.05
+    volume = np.sum(mask[..., lv_idx], axis=(0,1,2)) * voxel_size
+    masses = np.sum(mask[..., lv_myo_idx], axis=(0,1,2)) * voxel_size * 1.05
     mass = masses[dia_idx]
     edv = volume[dia_idx]
     esv = volume[sys_idx]
@@ -558,126 +578,180 @@ def edv_esv_view(raw_curve_path, frames, raw_dia_idx, raw_sys_idx, T, edited_gif
 
 
 def slice_navigation(D):
-    """Slice navigation UI with slider and Previous/Next buttons."""
     if "slice_idx" not in st.session_state:
         st.session_state.slice_idx = 0
 
-    def prev_slice(): st.session_state.slice_idx = max(0, st.session_state.slice_idx - 1)
-    def next_slice(): st.session_state.slice_idx = min(D-1, st.session_state.slice_idx + 1)
+    st.slider(
+        "Slice Index",
+        0,
+        D - 1,
+        key="slice_idx",
+    )
 
-    st.session_state.slice_idx = st.slider("Slice Index", 0, D-1, st.session_state.slice_idx, key="slice_slider")
     col_prev, col_next = st.columns(2)
+
     with col_prev:
-        st.button("Previous", on_click=prev_slice, use_container_width=True)
+        st.button(
+            "Previous",
+            on_click=lambda: st.session_state.update(
+                slice_idx=max(0, st.session_state.slice_idx - 1)
+            ),
+            use_container_width=True,
+        )
+
     with col_next:
-        st.button("Next", on_click=next_slice, use_container_width=True)
+        st.button(
+            "Next",
+            on_click=lambda: st.session_state.update(
+                slice_idx=min(D - 1, st.session_state.slice_idx + 1)
+            ),
+            use_container_width=True,
+        )
 
     return st.session_state.slice_idx
 
 
-
-def update_mask_from_canvas(canvas_result, mask_state, d, idx, channel, action, H, W, N):
-    if canvas_result is None or canvas_result.image_data is None:
-        return mask_state
-    objects = canvas_result.json_data.get("objects", [])
-    if not objects:
-        return mask_state
-
-    canvas_img = canvas_result.image_data.astype(np.uint8)
-    drawn_resized = np.array(Image.fromarray(canvas_img).resize((W, H), resample=Image.NEAREST))
-    mask_bin = np.any(drawn_resized[:, :, :3] != 0, axis=-1).astype(np.uint8)
-    mask_bin = thicken_close_and_fill(mask_bin)
-
-    if action == "Erase ✂️":
-        mask_state[:, :, d, idx, channel][mask_bin > 0] = 0
-    else:
-        for i in range(1, N):
-            if i != channel:
-                mask_state[:, :, d, idx, i][mask_bin > 0] = 0
-        mask_state[:, :, d, idx, channel][mask_bin > 0] = 1
-
-    return mask_state
-
 def get_overlay(img_slice, mask_state, H, W, N, OVERLAY_COLORS):
     overlay = Image.fromarray(np.stack([img_slice]*3, axis=-1)).convert("RGBA")
-    for i in range(1, N):
+    for i in channels:
         ch_mask = mask_state[:, :, i]
         if np.any(ch_mask):
             mask_img = np.zeros((H, W, 4), dtype=np.uint8)
             mask_img[ch_mask > 0] = OVERLAY_COLORS[i]
             overlay = Image.alpha_composite(overlay, Image.fromarray(mask_img))
-    overlay = overlay.resize((DISPLAY_H, DISPLAY_W), resample=Image.NEAREST)
     return overlay
+
 
 def select_brush(N):
     """Brush selection UI for channel, action, and stroke width."""
     st.caption('Brush Stroke Selection')
-    channel_labels = ["Myocardium 🔵", "Blood Pool 🔴"] + [f"Channel {i}" for i in range(3, N)]
-    channel = st.pills("Mask", options=list(range(1, N)),
-                       format_func=lambda x: channel_labels[x-1],
-                       selection_mode="single", default=1)
-    action = st.pills("Action", options=["Paint ✏️", "Erase ✂️"],
-                      selection_mode="single", default="Paint ✏️")
+    valid_channels = [i for i in range(N) if i != background_idx]
+    channel = st.pills(
+        "Mask",
+        options=valid_channels,
+        format_func=lambda x: BRUSH_LABELS[x],
+        selection_mode="single",
+        default=valid_channels[0] if valid_channels else None,
+    )
+
+    action = st.pills("Action", options=["Paint ✏️", "Erase ✂️"], selection_mode="single", default="Paint ✏️")
     stroke_width_map = {"very fine":5,"fine":10,"medium":20,"thick":30,"very thick":60}
-    stroke_width_sel = st.pills("Stroke width", options=list(stroke_width_map.keys()),
-                                selection_mode="single", default=list(stroke_width_map.keys())[2])
+    stroke_width_sel = st.pills("Stroke width", options=list(stroke_width_map.keys()), selection_mode="single", default=list(stroke_width_map.keys())[2])
     return channel, action, stroke_width_map[stroke_width_sel]
 
+
 def draw_segmentation(img_slice, mask_slice, H, W, N, OVERLAY_COLORS, stroke_width, stroke_color, action, d, idx, channel):
-    """Draw on a slice using st_canvas and update edited mask."""
+    # Generate overlay for canvas background
     overlay = get_overlay(img_slice, mask_slice, H, W, N, OVERLAY_COLORS)
+
+    # Initialize session key for canvas if not exists
+    if "canvas_key" not in st.session_state:
+        st.session_state.canvas_key = "editor_1"
+
+    # Create canvas
     canvas_result = st_canvas(
-        fill_color="rgba(0,0,0,0)",
         stroke_width=stroke_width,
         stroke_color=stroke_color,
         background_image=overlay,
-        update_streamlit=False,
+        update_streamlit=True,
         height=DISPLAY_H,
         width=DISPLAY_W,
-        drawing_mode="freedraw",
-        display_toolbar=True
+        drawing_mode='freedraw',
+        display_toolbar=True,
+        key=st.session_state.canvas_key
     )
 
-    if canvas_result and canvas_result.image_data is not None:
-        objects = canvas_result.json_data.get("objects", [])
-        if objects:
-            canvas_img = canvas_result.image_data.astype(np.uint8)
-            drawn_resized = np.array(Image.fromarray(canvas_img).resize((W,H), resample=Image.NEAREST))
-            mask_bin = np.any(drawn_resized[:,:,:3] != 0, axis=-1).astype(np.uint8)
-            mask_bin = thicken_close_and_fill(mask_bin)
-            edited_mask = st.session_state.edited_mask
-            if action == "Erase ✂️":
-                edited_mask[:,:,d,idx,channel][mask_bin > 0] = 0
-            else:
-                for i in range(1, N):
-                    if i != channel:
-                        edited_mask[:,:,d,idx,i][mask_bin > 0] = 0
-                edited_mask[:,:,d,idx,channel][mask_bin > 0] = 1
-            st.session_state.edited_mask = edited_mask
+    col1, col2= st.columns([1, 0.2])
+    edited_mask = st.session_state.edited_mask
+
+    with col1:
+        if st.button('Save Contour', type='primary', use_container_width=True):
+           if canvas_result and canvas_result.image_data is not None:
+                brush_data = np.array(canvas_result.image_data)  # H x W x 4 (RGBA)
+                brush_data_resized = np.array(Image.fromarray(brush_data).resize((W, H), resample=Image.NEAREST))
+                
+                if action == "Erase ✂️":
+                    mask_bool = np.any(brush_data_resized[:, :, :3] != 0, axis=-1)
+                    mask_bool = thicken_close_and_fill(mask_bool)
+                    edited_mask[:, :, d, idx, :][mask_bool] = 0
+                else:
+                    rgb = brush_data_resized[:, :, :3].astype(np.float32)
+                    alpha = brush_data_resized[:, :, 3].astype(np.float32) / 255.0
+
+                    # Prepare overlay color array
+                    overlay_colors_list = np.array([color[:3] for color in OVERLAY_COLORS.values()], dtype=np.float32)
+                    overlay_keys = list(OVERLAY_COLORS.keys())
+
+                    # Compute distance to each overlay color
+                    h, w, _ = rgb.shape
+                    rgb_flat = rgb.reshape(-1, 3)  # (H*W, 3)
+                    alpha_flat = alpha.flatten()
+                    distances = np.linalg.norm(rgb_flat[:, None, :] - overlay_colors_list[None, :, :], axis=-1)  # (H*W, n_colors)
+                    closest_idx = np.argmin(distances, axis=1)
+
+                    # Apply only to non-transparent pixels
+                    mask_flat = np.zeros((h * w, len(overlay_keys)), dtype=np.uint8)
+                    for i, key in enumerate(overlay_keys):
+                        mask_flat[:, i] = ((closest_idx == i) & (alpha_flat > 0)).astype(np.uint8)
+
+                    # Reshape back
+                    for i, key in enumerate(overlay_keys):
+                        mask_bool = mask_flat[:, i].reshape(h, w)
+                        mask_bool = thicken_close_and_fill(mask_bool)
+                        mask_bool = np.array(Image.fromarray(mask_bool).resize((W, H), resample=Image.NEAREST))
+                        
+                        # Clear affected pixels first
+                        edited_mask[:, :, d, idx, :][mask_bool > 0] = 0
+                        # Apply current channel
+                        edited_mask[:, :, d, idx, key][mask_bool > 0] = 1
+
+                # Clear canvas
+                st.session_state.canvas_key = f"editor_{np.random.randint(1e6)}"
+                st.rerun()
+
+
+    with col2:
+        if st.button('🗑️', use_container_width=True):
+            edited_mask[:,:,d,idx,:] = 0
+            # Also clear canvas
+            st.session_state.canvas_key = f"editor_{np.random.randint(1e6)}"
             st.rerun()
 
 
 def display_corrected_mask(image, edited_mask, dia_idx, sys_idx, idx_label, edited_gif_path):
-    """Display corrected mask as GIF or static frame."""
+    """Display corrected mask as GIF or static frame, caching loaded frames."""
     st.caption('Corrected Mask')
-    view_mode = st.radio('View', ['GIF','Static'], index=0, horizontal=True)
+    view_mode = st.radio('View', ['GIF', 'Static'], index=0, horizontal=True)
 
-    if mask_hash(edited_mask) != st.session_state.mask_hash:
+    # Compute mask hash
+    current_hash = hashlib.md5(edited_mask.tobytes()).hexdigest()
+
+    # Regenerate GIF only if mask changed
+    if st.session_state.get('mask_hash', None) != current_hash:
         with st.spinner('Generating Corrected Mask...'):
             make_video(
-                image[:,:,:, [dia_idx, sys_idx]],
-                edited_mask[:,:,:, [dia_idx, sys_idx], :],
+                image[:, :, :, [dia_idx, sys_idx]],
+                edited_mask[:, :, :, [dia_idx, sys_idx], :],
                 save_file=edited_gif_path
             )
-        st.session_state.mask_hash = mask_hash(edited_mask)
+        st.session_state.mask_hash = current_hash
+        # Reload frames into session_state cache
+        gif = Image.open(edited_gif_path)
+        st.session_state.gif_frames = [frame.copy() for frame in ImageSequence.Iterator(gif)]
+
+    # Load cached frames if available
+    frames = st.session_state.get('gif_frames', None)
+    if frames is None:
+        gif = Image.open(edited_gif_path)
+        frames = [frame.copy() for frame in ImageSequence.Iterator(gif)]
+        st.session_state.gif_frames = frames
 
     if view_mode == 'GIF':
         st.image(edited_gif_path)
     else:
-        gif = Image.open(edited_gif_path)
-        frames = [frame.copy() for frame in ImageSequence.Iterator(gif)]
         view_idx = 0 if idx_label == "End-Diastole" else 1
         st.image(frames[view_idx])
+
 
 
 def mask_editor_view(N, D, H, W, image, edited_mask, dia_idx, sys_idx, OVERLAY_COLORS, edited_gif_path):
@@ -686,7 +760,8 @@ def mask_editor_view(N, D, H, W, image, edited_mask, dia_idx, sys_idx, OVERLAY_C
         st.error("Select and confirm EDV/ESV first.")
         st.stop()
 
-    col1, col2, col3 = st.columns(3)
+    toc = time.time()
+    col1, col2, col3 = st.columns([1,1.5,1.5])
 
     with col1:
         channel, action, stroke_width = select_brush(N)
@@ -697,21 +772,22 @@ def mask_editor_view(N, D, H, W, image, edited_mask, dia_idx, sys_idx, OVERLAY_C
 
     with col2:
         st.caption('Segmentation Editor')
-        edit_mode = st.radio('Mode',['Editor','Viewer'], index=0, horizontal=True)
+
         idx = dia_idx if idx_label=="End-Diastole" else sys_idx
         img_slice = ((image[:,:,d,idx] - image[:,:,d,idx].min()) / 
                      (image[:,:,d,idx].max() - image[:,:,d,idx].min()) * 255).astype(np.uint8)
-        stroke_color = "rgba(200,200,200,0.75)" if action == "Erase ✂️" else f"rgba{OVERLAY_COLORS[channel][:3]+(0.9,)}"
+                     
+        edit_mode = st.radio('Mode',['Editor','Viewer'], index=0, horizontal=True)
+        stroke_color = "rgba(200,200,200,0.75)" if action == "Erase ✂️" else f"rgba{OVERLAY_COLORS[channel][:3]+(0.4,)}"
         if edit_mode == 'Viewer':
             st.image(img_slice, width=DISPLAY_W)
         else:
             draw_segmentation(img_slice, edited_mask[:,:,d,idx,:], H, W, N, OVERLAY_COLORS, stroke_width, stroke_color, action, d, idx, channel)
 
-        if st.button('Clear Whole Slice', type='primary'):
-            edited_mask[:,:,d,idx,0] = 1
-            edited_mask[:,:,d,idx,1:] = 0
-            st.session_state.edited_mask = edited_mask
-            st.rerun()
-
+         
     with col3:
         display_corrected_mask(image, edited_mask, dia_idx, sys_idx, idx_label, edited_gif_path)
+   
+    tic = time.time()
+    dt = round((tic - toc), 4)
+    print(dt , 's')

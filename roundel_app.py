@@ -7,9 +7,9 @@ st.set_page_config(page_title="Roundel", page_icon="⭕️", layout='wide')
 # -----------------------------
 # Data paths and series info
 # -----------------------------
-data_path = '/workspaces/local/Roundel/data/test'
-sax_series_uid_list = sorted([uid.replace('image___','').split('/')[-1].replace('.nii.gz','') for uid in glob.glob(f'{data_path}/*') if 'image' in uid])
-
+data_path = '/workspaces/Roundel/data/major_revisions'
+# data_path = '/workspaces/local/Roundel/data/test'
+sax_series_uid_list = sorted([uid.replace('image___','').split('/')[-1].replace('.nii.gz','') for uid in glob.glob(f'{data_path}/*') if 'image' in uid and 'bi' not in uid])
 # Sidebar dropdown
 st.write('# Roundel App (2D)')
 
@@ -79,7 +79,6 @@ if view == "Mask Editor 📝":
 # --------------------------------------------------------------
 
 if view == "Final Result ✅":
-    sax_series_uid=sax_series_uid,
     raw_image=st.session_state.raw['image']
     raw_mask=st.session_state.raw['mask']
     raw_edv = st.session_state.raw['raw_edv']
@@ -104,8 +103,8 @@ if view == "Final Result ✅":
 
     # Create full-size arrays
     final_mask_2d = np.zeros(raw_mask.shape, dtype=raw_mask.dtype)
-    final_mask_2d[y_min:y_max, x_min:x_max, :, [dia_idx, sys_idx], :] = edited_mask[:, :, :, [dia_idx, sys_idx], :]
-    
+    final_mask_2d[y_min:y_max, x_min:x_max, :, [dia_idx, sys_idx], 1:] = edited_mask[:, :, :, [dia_idx, sys_idx], 1:]
+    final_mask_2d = np.argmax(final_mask_2d, -1)
     
     make_video(
         preprocessed_image[:, :, :, [dia_idx, sys_idx]],
@@ -115,7 +114,7 @@ if view == "Final Result ✅":
 
     make_video(
         raw_image[:, :, :, [dia_idx, sys_idx]],
-        final_mask_2d[:, :, :, [dia_idx, sys_idx], :],
+        np.eye(N, dtype=np.uint8)[final_mask_2d][:, :, :, [dia_idx, sys_idx], :],
         save_file=final_gif_path, 
         scale = 1.5
     )
@@ -157,10 +156,6 @@ if view == "Final Result ✅":
                 }).to_csv(f'results/edited_sax_df/{sax_series_uid}.csv', index = False)
 
     with col2:
-
-
-
-
         st.caption('Final Cropped Mask')
         st.image(edited_gif_path)
     

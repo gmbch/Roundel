@@ -12,7 +12,7 @@
 	// (note that this may need to be increased if using ONNX and
 	// you encounter a memory buffer allocation error when running on GPU)
 	"runArgs": [
-		 "--gpus=all"
+		//  "--gpus=all"
 	],
 	// Enable plotting.
 	"mounts": [
