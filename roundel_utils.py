@@ -24,12 +24,13 @@ from scipy.ndimage import (
     binary_erosion,
     binary_closing,
     gaussian_filter
-)  
-from skimage.morphology import disk  
+)
+from skimage.morphology import disk
 from skimage.measure import find_contours
 import pandas as pd
 import time
 import cv2
+
 
 os.makedirs('results/temp', exist_ok=True)
 os.makedirs('results/gifs', exist_ok=True)
@@ -67,17 +68,76 @@ edited_gif_path = f'results/temp/edited.gif'
 raw_curve_path = f'results/temp/raw_metrics.png'
 edited_curve_path = f'results/temp/edited_metrics.png'
 
+
+def skip_case(study_uid, patient, study_date):
+    """UI handler for skipping a case."""
+    from aws_utils import skip_case_ddb, fetch_staged_roundel_cases
+
+    # Update DynamoDB
+    skip_case_ddb(study_uid)
+
+    st.warning(f"⏭️ Skipped case for {patient} ({study_date})")
+
+    # Refresh staged list
+    new_cases = fetch_staged_roundel_cases()
+    new_cases = sorted(new_cases, key=lambda c: str(c.get("fid", "")))
+
+    # Clear session state
+    clear_keys = [
+        "edited_mask", "edv_esv_selected", "preprocessed", "raw",
+        "point1", "point2", "coord1", "coord2", "crop1", "crop2",
+        "selected_case"
+    ]
+    for k in clear_keys:
+        st.session_state.pop(k, None)
+
+    # If none left → stop
+    if not new_cases:
+        st.sidebar.success("🎉 All Roundel cases completed!")
+        st.stop()
+
+    # Move to next case
+    st.session_state["selected_case"] = new_cases[0]
+
+    # Reset tab
+    st.session_state["next_view"] = "EDV/ESV Finder 🔍"
+
+    # Reload UI
+    st.rerun()
+
+
+def load_font(size):
+    """
+    try:
+        font = load_font(int(18 * scale))
+    except:
+        font = ImageFont.load_default()
+    """
+
+    # Try Linux font
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
+    except:
+        pass
+    # Try Windows font
+    try:
+        return ImageFont.truetype("C:/Windows/Fonts/arial.ttf", size)
+    except:
+        pass
+    # Fallback (non scalable)
+    return ImageFont.load_default()
+
 # --------------------------------------------------------------
 # Initialization
 # --------------------------------------------------------------
-def initialize_app(data_path, sax_series_uid, preprocess=True):
-    
+def initialize_app(data_path, study_uid, pixelspacing, thickness, preprocess=True):
+
     # Store the last selected UID in session_state
     if "last_sax_uid" not in st.session_state:
         st.session_state.last_sax_uid = None
 
     # If user changes series UID, clear relevant session state
-    if st.session_state.last_sax_uid != sax_series_uid:
+    if st.session_state.last_sax_uid != study_uid:
         keys_to_clear = [
             "preprocessed",
             "edited_mask",
@@ -90,16 +150,16 @@ def initialize_app(data_path, sax_series_uid, preprocess=True):
         for key in keys_to_clear:
             if key in st.session_state:
                 del st.session_state[key]
-        st.session_state.last_sax_uid = sax_series_uid
+        st.session_state.last_sax_uid = study_uid
 
     if "initialized_all" in st.session_state:
         return
 
-    raw_image = load_nii(f'{data_path}/image___{sax_series_uid}.nii.gz')
-    raw_mask = load_nii(f'{data_path}/masks___{sax_series_uid}.nii.gz').astype('uint8')
-    sax_df = pd.read_csv(f'{data_path}/saxdf___{sax_series_uid}.csv')
+    raw_image = load_nii(f'{data_path}/image___{study_uid}.nii.gz')
+    raw_mask = load_nii(f'{data_path}/masks___{study_uid}.nii.gz').astype('uint8')
+    # sax_df = pd.read_csv(f'{data_path}/saxdf___{study_uid}.csv')
 
-    pixelspacing, thickness = float(sax_df['pixelspacing'].iloc[0]), float(sax_df['thickness'].iloc[0])
+    # pixelspacing, thickness = float(sax_df['pixelspacing'].iloc[0]), float(sax_df['thickness'].iloc[0])
 
     N = len(np.unique(raw_mask))
     raw_mask = np.eye(N, dtype=np.uint8)[raw_mask]
@@ -108,10 +168,9 @@ def initialize_app(data_path, sax_series_uid, preprocess=True):
     # -----------------------------
     # Compute raw indices
     # -----------------------------
-    volume = np.sum(raw_mask[...,-1], axis=(0,1,2))
+    volume = np.sum(raw_mask[..., -1], axis=(0, 1, 2))
     raw_dia_idx = int(np.argmax(volume))
     raw_sys_idx = np.where(volume != 0)[0][np.argmin(volume[volume != 0])]
-
 
     # Compute raw metrics
     raw_volume, raw_masses, raw_edv, raw_esv, raw_sv, raw_ef, raw_mass = calculate_sax_metrics(
@@ -124,14 +183,14 @@ def initialize_app(data_path, sax_series_uid, preprocess=True):
         "shape": raw_shape,
         "raw_dia_idx": raw_dia_idx,
         "raw_sys_idx": raw_sys_idx,
-        "raw_edv":raw_edv,
-        "raw_esv":raw_esv,
-        "raw_sv":raw_sv,
-        "raw_ef":raw_ef,
-        "raw_mass":raw_mass,
+        "raw_edv": raw_edv,
+        "raw_esv": raw_esv,
+        "raw_sv": raw_sv,
+        "raw_ef": raw_ef,
+        "raw_mass": raw_mass,
         "raw_volume": raw_volume,
-        'pixelspacing':pixelspacing,
-        'thickness':thickness
+        'pixelspacing': pixelspacing,
+        'thickness': thickness
     }
 
     # -----------------------------
@@ -140,26 +199,30 @@ def initialize_app(data_path, sax_series_uid, preprocess=True):
     if "edv_esv_selected" not in st.session_state:
         st.session_state.edv_esv_selected = {"dia_idx": None, "sys_idx": None, "confirmed": False}
 
-
     st.session_state['subpixel_resolution'] = 4
     # -----------------------------
     # Preprocess / crop if required
     # -----------------------------
     if preprocess:
-        x_min, y_min, x_max, y_max = find_crop_box(np.max(raw_mask[...,[lv_idx, lv_myo_idx]], axis=(-1,-2,-3)), crop_factor=1.5)
+        x_min, y_min, x_max, y_max = find_crop_box(np.max(raw_mask[..., [lv_idx, lv_myo_idx]], axis=(-1, -2, -3)),
+                                                   crop_factor=1.5)
         preprocessed_image = raw_image[y_min:y_max, x_min:x_max, :, :]
         preprocessed_mask = raw_mask[y_min:y_max, x_min:x_max, :, :, :].astype('uint8')
         H, W, D, T, N = preprocessed_mask.shape
 
-        has_masks = np.where(np.sum(preprocessed_mask[...,-1], axis = (0,1,3))>0)[0]
-        mid_slice = len(has_masks)//2
-        make_video(preprocessed_image[:,:,has_masks[mid_slice-3:mid_slice+3],:], preprocessed_mask[:,:,has_masks[mid_slice-3:mid_slice+3],:, :] * 0, save_file=edv_esv_gif_path)
+        has_masks = np.where(np.sum(preprocessed_mask[..., -1], axis=(0, 1, 3)) > 0)[0]
+        mid_slice = len(has_masks) // 2
+        make_video(preprocessed_image[:, :, has_masks[mid_slice - 3:mid_slice + 3], :],
+                   preprocessed_mask[:, :, has_masks[mid_slice - 3:mid_slice + 3], :, :] * 0,
+                   save_file=edv_esv_gif_path)
 
+        smoothed_image = cv_zoom(preprocessed_image,
+                                 zoom=[st.session_state['subpixel_resolution'], st.session_state['subpixel_resolution'],
+                                       1, 1])
+        smoothed_mask = smooth_zoom(preprocessed_mask, zoom=[st.session_state['subpixel_resolution'],
+                                                             st.session_state['subpixel_resolution'], 1, 1, 1])
+        make_video(preprocessed_image, preprocessed_mask * 0, save_file=blank_gif_path)
 
-        smoothed_image = cv_zoom(preprocessed_image, zoom = [st.session_state['subpixel_resolution'],st.session_state['subpixel_resolution'],1,1])
-        smoothed_mask = smooth_zoom(preprocessed_mask, zoom = [st.session_state['subpixel_resolution'],st.session_state['subpixel_resolution'],1,1,1])
-        make_video(preprocessed_image, preprocessed_mask*0, save_file=blank_gif_path)
-                
         # make_video(smoothed_image, smoothed_mask, save_file=preprocessed_gif_path)
 
         gif = Image.open(edv_esv_gif_path)
@@ -171,7 +234,7 @@ def initialize_app(data_path, sax_series_uid, preprocess=True):
             "smooth_mask": smoothed_mask,
             "H": H, "W": W, "D": D, "T": T, "N": N,
             "edv_esv_frames": [frame.copy() for frame in ImageSequence.Iterator(gif)],
-            'crop_box':[x_min, y_min, x_max, y_max]
+            'crop_box': [x_min, y_min, x_max, y_max]
         }
 
     else:
@@ -181,7 +244,7 @@ def initialize_app(data_path, sax_series_uid, preprocess=True):
             "mask": raw_mask,
             "H": raw_shape[0], "W": raw_shape[1], "D": raw_shape[2], "T": raw_shape[3], "N": N,
             "frames": None,
-            'crop_box':[0, 0, raw_image.shape[0], raw_image.shape[1]]
+            'crop_box': [0, 0, raw_image.shape[0], raw_image.shape[1]]
 
         }
 
@@ -194,16 +257,15 @@ def initialize_app(data_path, sax_series_uid, preprocess=True):
     #     save_path=raw_curve_path
     # )
 
-
     # -----------------------------
     # Initialize edited mask
     # -----------------------------
     st.session_state['edited_mask'] = st.session_state.preprocessed["smooth_mask"].copy()
-    st.session_state['mask_hash']= mask_hash(st.session_state.preprocessed["mask"])
+    st.session_state['mask_hash'] = mask_hash(st.session_state.preprocessed["mask"])
     st.session_state.initialized_all = True
 
 
-def cv_zoom(images, zoom=[4,4,1,1,1], interpolation=cv2.INTER_CUBIC):
+def cv_zoom(images, zoom=[4, 4, 1, 1, 1], interpolation=cv2.INTER_CUBIC):
     """
     Resize height and width of a 4D or 5D array using OpenCV. Only H and W are scaled.
 
@@ -219,23 +281,26 @@ def cv_zoom(images, zoom=[4,4,1,1,1], interpolation=cv2.INTER_CUBIC):
 
     if images.ndim == 4:
         h, w, d, t = images.shape
-        resized = np.zeros((int(h*h_zoom), int(w*w_zoom), d, t), dtype=images.dtype)
+        resized = np.zeros((int(h * h_zoom), int(w * w_zoom), d, t), dtype=images.dtype)
         for z in range(d):
             for tau in range(t):
-                resized[..., z, tau] = cv2.resize(images[..., z, tau], (int(w*w_zoom), int(h*h_zoom)), interpolation=interpolation)
+                resized[..., z, tau] = cv2.resize(images[..., z, tau], (int(w * w_zoom), int(h * h_zoom)),
+                                                  interpolation=interpolation)
     elif images.ndim == 5:
         h, w, d, t, c = images.shape
-        resized = np.zeros((int(h*h_zoom), int(w*w_zoom), d, t, c), dtype=images.dtype)
+        resized = np.zeros((int(h * h_zoom), int(w * w_zoom), d, t, c), dtype=images.dtype)
         for z in range(d):
             for tau in range(t):
                 for ch in range(c):
-                    resized[..., z, tau, ch] = cv2.resize(images[..., z, tau, ch], (int(w*w_zoom), int(h*h_zoom)), interpolation=interpolation)
+                    resized[..., z, tau, ch] = cv2.resize(images[..., z, tau, ch], (int(w * w_zoom), int(h * h_zoom)),
+                                                          interpolation=interpolation)
     else:
         raise ValueError("Input must be 4D or 5D array.")
 
     return resized
 
-def smooth_zoom(mask, zoom=[4,4,1,1,1], sigma=5.0, to_discrete=True):
+
+def smooth_zoom(mask, zoom=[4, 4, 1, 1, 1], sigma=5.0, to_discrete=True):
     """
     Zoom a 4D or 5D categorical mask and smooth edges for visual appearance.
 
@@ -252,16 +317,16 @@ def smooth_zoom(mask, zoom=[4,4,1,1,1], sigma=5.0, to_discrete=True):
     zoomed = cv_zoom(mask.astype(np.float32), zoom, interpolation=cv2.INTER_CUBIC)
     dims = zoomed.ndim
     if dims == 4:
-        H,W,D,T = zoomed.shape
+        H, W, D, T = zoomed.shape
         for z in range(D):
             for t in range(T):
-                zoomed[..., z, t] = cv2.GaussianBlur(zoomed[..., z, t], (0,0), sigmaX=sigma, sigmaY=sigma)
+                zoomed[..., z, t] = cv2.GaussianBlur(zoomed[..., z, t], (0, 0), sigmaX=sigma, sigmaY=sigma)
     elif dims == 5:
-        H,W,D,T,C = zoomed.shape
+        H, W, D, T, C = zoomed.shape
         for z in range(D):
             for t in range(T):
                 for c in range(C):
-                    zoomed[..., z, t, c] = cv2.GaussianBlur(zoomed[..., z, t, c], (0,0), sigmaX=sigma, sigmaY=sigma)
+                    zoomed[..., z, t, c] = cv2.GaussianBlur(zoomed[..., z, t, c], (0, 0), sigmaX=sigma, sigmaY=sigma)
     else:
         raise ValueError("Mask must be 4D or 5D")
 
@@ -280,6 +345,7 @@ def load_nii(nii_path):
     file = nib.load(nii_path)
     data = file.get_fdata(caching='unchanged')
     return data
+
 
 def thicken_close_fill_and_smooth(strokes, stroke_width):
     if strokes is None or not strokes.any():
@@ -300,7 +366,7 @@ def thicken_close_fill_and_smooth(strokes, stroke_width):
             y1, x1 = c1[:, 0], c1[:, 1]
             y2, x2 = c2[:, 0], c2[:, 1]
             if (y2.min() > y1.min() and y2.max() < y1.max() and
-                x2.min() > x1.min() and x2.max() < x1.max()):
+                    x2.min() > x1.min() and x2.max() < x1.max()):
                 has_ring = True
                 break
         if has_ring:
@@ -311,7 +377,7 @@ def thicken_close_fill_and_smooth(strokes, stroke_width):
         closed = binary_dilation(strokes, iterations=dilation_factor)
         filled = binary_fill_holes(closed)
         filled = binary_erosion(filled, iterations=dilation_factor)
-        
+
         # Apply minor Gaussian blur and re-threshold to smooth edges
         # blurred = gaussian_filter(filled.astype(float), sigma=0.5)
         # smoothed = blurred > 0.48  # Convert back to binary
@@ -323,9 +389,7 @@ def thicken_close_fill_and_smooth(strokes, stroke_width):
         return strokes.astype('uint8')
 
 
-
-
-def make_video(image, mask, save_file, mask_frames = 'all', scale=1):
+def make_video(image, mask, save_file, mask_frames='all', scale=1):
     position = image.shape[2]
     timesteps = image.shape[3]
 
@@ -333,12 +397,16 @@ def make_video(image, mask, save_file, mask_frames = 'all', scale=1):
     grid_cols = (position + grid_rows - 1) // grid_rows
 
     H, W = image.shape[:2]
-    GIF_H = H*GIF_W/W
+    GIF_H = H * GIF_W / W
     H_scaled, W_scaled = round(GIF_H * scale), round(GIF_W * scale)
     img_min, img_max = np.min(image), np.max(image)
 
+    # try:
+    #     font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", int(18 * scale))
+    # except:
+    #     font = ImageFont.load_default()
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", int(18 * scale))
+        font = load_font(int(18 * scale))
     except:
         font = ImageFont.load_default()
 
@@ -358,8 +426,8 @@ def make_video(image, mask, save_file, mask_frames = 'all', scale=1):
         for idx in range(position):
             row, col = divmod(idx, grid_cols)
 
-            img_slice = ((image[:,:,idx,t] - img_min) / (img_max - img_min + 1e-9) * 255).astype(np.uint8)
-            img_rgb = np.stack([img_slice]*3, axis=-1)
+            img_slice = ((image[:, :, idx, t] - img_min) / (img_max - img_min + 1e-9) * 255).astype(np.uint8)
+            img_rgb = np.stack([img_slice] * 3, axis=-1)
             img_pil = Image.fromarray(img_rgb, mode="RGB").convert("RGBA")
 
             # Resize slice
@@ -368,7 +436,7 @@ def make_video(image, mask, save_file, mask_frames = 'all', scale=1):
             overlay = np.zeros((H, W, 4), dtype=np.uint8)
             if t in mask_frames:
                 for ch in channels:
-                    ch_mask = mask[:,:,idx,t,ch]
+                    ch_mask = mask[:, :, idx, t, ch]
                     if np.any(ch_mask):
                         color = np.array(OVERLAY_COLORS[ch], dtype=np.uint8)
                         overlay[ch_mask > 0] = color
@@ -376,27 +444,26 @@ def make_video(image, mask, save_file, mask_frames = 'all', scale=1):
             img_pil.alpha_composite(overlay_pil)
 
             draw_tile = ImageDraw.Draw(img_pil)
-            draw_tile.rectangle([0,0,int(28*scale), int(22*scale)], fill=(211,211,211,255))
-            draw_tile.text((3*scale,2*scale), f"{idx}", fill=(0,0,0,255), font=font)
+            draw_tile.rectangle([0, 0, int(28 * scale), int(22 * scale)], fill=(211, 211, 211, 255))
+            draw_tile.text((3 * scale, 2 * scale), f"{idx}", fill=(0, 0, 0, 255), font=font)
 
             canvas.paste(img_pil, (col * W_scaled, row * H_scaled), img_pil)
 
         draw_canvas.rectangle(
-            [canvas.width - int(60*scale), canvas.height - int(20*scale),
+            [canvas.width - int(60 * scale), canvas.height - int(20 * scale),
              canvas.width, canvas.height],
-            fill=(211,211,211,255)
+            fill=(211, 211, 211, 255)
         )
         draw_canvas.text(
-            (canvas.width - int(55*scale), canvas.height - int(20*scale)),
+            (canvas.width - int(55 * scale), canvas.height - int(20 * scale)),
             f"{t:02}/{timesteps - 1:02}",
-            fill=(0,0,0,255),
+            fill=(0, 0, 0, 255),
             font=font
         )
 
         frames.append(canvas.convert("RGB"))
 
-    imageio.mimsave(save_file, frames, fps=timesteps/2, loop=0)
-
+    imageio.mimsave(save_file, frames, fps=timesteps / 2, loop=0)
 
 
 def find_crop_box(mask, crop_factor):
@@ -415,45 +482,51 @@ def find_crop_box(mask, crop_factor):
     # Check shape of the input is 2D
     if len(mask.shape) != 2:
         raise ValueError("Input mask must be a 2D array")
-    
-    y = np.sum(mask, axis=1) # sum the masks across columns of array, returns a 1D array of row totals
-    x = np.sum(mask, axis=0) # sum the masks across rows of array, returns a 1D array of column totals
 
-    top = np.min(np.nonzero(y)) - 1 # Returns the indices of the elements in 1d row totals array that are non-zero, then finds the minimum value and subtracts 1 (i.e. top extent of mask)
-    bottom = np.max(np.nonzero(y)) + 1 # Returns the indices of the elements in 1d row totals array that are non-zero, then finds the maximum value and adds 1 (i.e. bottom extent of mask)
+    y = np.sum(mask, axis=1)  # sum the masks across columns of array, returns a 1D array of row totals
+    x = np.sum(mask, axis=0)  # sum the masks across rows of array, returns a 1D array of column totals
 
-    left = np.min(np.nonzero(x)) - 1 # Returns the indices of the elements in 1d column totals array that are non-zero, then finds the minimum value and subtracts 1 (i.e. left extent of mask)
-    right = np.max(np.nonzero(x)) + 1 # Returns the indices of the elements in 1d column totals array that are non-zero, then finds the maximum value and adds 1 (i.e. right extent of mask)
+    top = np.min(np.nonzero(
+        y)) - 1  # Returns the indices of the elements in 1d row totals array that are non-zero, then finds the minimum value and subtracts 1 (i.e. top extent of mask)
+    bottom = np.max(np.nonzero(
+        y)) + 1  # Returns the indices of the elements in 1d row totals array that are non-zero, then finds the maximum value and adds 1 (i.e. bottom extent of mask)
+
+    left = np.min(np.nonzero(
+        x)) - 1  # Returns the indices of the elements in 1d column totals array that are non-zero, then finds the minimum value and subtracts 1 (i.e. left extent of mask)
+    right = np.max(np.nonzero(
+        x)) + 1  # Returns the indices of the elements in 1d column totals array that are non-zero, then finds the maximum value and adds 1 (i.e. right extent of mask)
     if abs(right - left) > abs(top - bottom):
-        largest_side = abs(right - left) # Find the largest side of the bounding box
+        largest_side = abs(right - left)  # Find the largest side of the bounding box
     else:
         largest_side = abs(top - bottom)
-    x_mid = round((left + right) / 2) # Find the mid-point of the x-length of mask
-    y_mid = round((top + bottom) / 2) # Find the mid-point of the y-length of mask
-    half_largest_side = round(largest_side * crop_factor / 2) # Find half the largest side of the bounding box (crop factor scales the largest side to ensure whole heart and some surrounding is captured)
-    x_max, x_min = round(x_mid + half_largest_side), round(x_mid - half_largest_side) # Find the maximum and minimum x-values of the bounding box
-    y_max, y_min = round(y_mid + half_largest_side), round(y_mid - half_largest_side) # Find the maximum and minimum y-values of the bounding box
+    x_mid = round((left + right) / 2)  # Find the mid-point of the x-length of mask
+    y_mid = round((top + bottom) / 2)  # Find the mid-point of the y-length of mask
+    half_largest_side = round(
+        largest_side * crop_factor / 2)  # Find half the largest side of the bounding box (crop factor scales the largest side to ensure whole heart and some surrounding is captured)
+    x_max, x_min = round(x_mid + half_largest_side), round(
+        x_mid - half_largest_side)  # Find the maximum and minimum x-values of the bounding box
+    y_max, y_min = round(y_mid + half_largest_side), round(
+        y_mid - half_largest_side)  # Find the maximum and minimum y-values of the bounding box
     if x_min < 0:
-        x_max -= x_min # if x_min less than zero, expand the x_max value by the absolute value of x_min, to ensure bounding box is same size
+        x_max -= x_min  # if x_min less than zero, expand the x_max value by the absolute value of x_min, to ensure bounding box is same size
         x_min = 0
 
     if y_min < 0:
-        y_max -= y_min # if y_min less than zero, expand the y_max value by the absolute value of y_min, to ensure bounding box is same size
+        y_max -= y_min  # if y_min less than zero, expand the y_max value by the absolute value of y_min, to ensure bounding box is same size
         y_min = 0
 
     return [x_min, y_min, x_max, y_max]
 
 
-
 def calculate_sax_metrics(mask, pixelspacing, thickness, dia_idx, sys_idx):
     voxel_size = pixelspacing ** 2 * thickness / 1000
-    volume = np.sum(mask[..., lv_idx], axis=(0,1,2)) * voxel_size
-    masses = np.sum(mask[..., lv_myo_idx], axis=(0,1,2)) * voxel_size * 1.05
+    volume = np.sum(mask[..., lv_idx], axis=(0, 1, 2)) * voxel_size
+    masses = np.sum(mask[..., lv_myo_idx], axis=(0, 1, 2)) * voxel_size * 1.05
     mass = masses[dia_idx]
     edv = volume[dia_idx]
     esv = volume[sys_idx]
     sv = edv - esv
-    ef = (sv) * 100/edv
+    ef = (sv) * 100 / edv
     return volume, masses, edv, esv, sv, ef, mass
 
 
@@ -469,22 +542,21 @@ def _label_vline(ax, x, color, y_pad=0.02):
         ha="center",
         va="bottom",
         rotation=90,
-        alpha = 0.75
+        alpha=0.75
     )
 
 
 def plot_volume_mass_curve(
-    raw_volume,
-    raw_masses,
-    edited_volume,
-    edited_masses,
-    raw_dia_idx,
-    raw_sys_idx,
-    dia_idx,
-    sys_idx,
-    save_path,
+        raw_volume,
+        raw_masses,
+        edited_volume,
+        edited_masses,
+        raw_dia_idx,
+        raw_sys_idx,
+        dia_idx,
+        sys_idx,
+        save_path,
 ):
-    
     fig, axes = plt.subplots(2, 1, figsize=(8, 5.25), sharex=True)
 
     frames_raw = np.arange(len(raw_volume))
@@ -507,7 +579,6 @@ def plot_volume_mass_curve(
         label=f"EDV: {edv:.1f} mL | ESV: {esv:.1f} mL",
     )
     axes[0].set_xticks(np.arange(len(edited_volume)))
-
 
     axes[0].axvline(raw_dia_idx, color=raw_color, linestyle="--", linewidth=1.5, alpha=0.75)
     axes[0].axvline(raw_sys_idx, color=raw_color, linestyle=":", linewidth=1.5, alpha=0.75)
@@ -545,19 +616,19 @@ def plot_volume_mass_curve(
     axes[1].legend(loc="upper center", bbox_to_anchor=(0.5, 1), edgecolor="none")
 
     plt.subplots_adjust(hspace=0.05, top=1, bottom=0)
-    plt.savefig(save_path, bbox_inches="tight", dpi = 400)
+    plt.savefig(save_path, bbox_inches="tight", dpi=400)
     plt.close(fig)
 
-def plot_volume_curve(
-    raw_volume,
-    edited_volume,
-    raw_dia_idx,
-    raw_sys_idx,
-    dia_idx,
-    sys_idx,
-    save_path,
-):
 
+def plot_volume_curve(
+        raw_volume,
+        edited_volume,
+        raw_dia_idx,
+        raw_sys_idx,
+        dia_idx,
+        sys_idx,
+        save_path,
+):
     fig, ax = plt.subplots(1, 1, figsize=(8, 4))
 
     frames_raw = np.arange(len(raw_volume))
@@ -598,9 +669,6 @@ def plot_volume_curve(
     plt.close(fig)
 
 
-
-
-
 def confirm_selection(dia_idx, sys_idx):
     """Store confirmed EDV/ESV indices in session state."""
     st.session_state.edv_esv_selected.update({
@@ -609,33 +677,34 @@ def confirm_selection(dia_idx, sys_idx):
         "confirmed": True
     })
 
+
 def wrap(key, min_val, max_val):
     if st.session_state[key] > max_val:
         st.session_state[key] = min_val
     elif st.session_state[key] < min_val:
         st.session_state[key] = max_val
 
+
 def frame_index_slider(
-    T,
-    frames,
-    initial_idx,
-    label,
-    disabled_flag,
-    key
+        T,
+        frames,
+        initial_idx,
+        label,
+        disabled_flag,
+        key
 ):
     idx = st.slider(
         f"{label} | *{initial_idx}*",
         -1,
         T,
         value=initial_idx,
-        key = key,
+        key=key,
         on_change=wrap,
-        args=(key, 0, T-1),
+        args=(key, 0, T - 1),
         disabled=disabled_flag
     )
     st.image(frames[idx], use_container_width=True)
     return idx
-
 
 
 def edv_esv_view():
@@ -643,22 +712,22 @@ def edv_esv_view():
     if "edv_esv_selected" not in st.session_state:
         st.session_state.edv_esv_selected = {"dia_idx": None, "sys_idx": None, "confirmed": False}
 
-    frames= st.session_state.preprocessed['edv_esv_frames']
-    raw_dia_idx=st.session_state.raw['raw_dia_idx']
-    raw_sys_idx=st.session_state.raw['raw_sys_idx'] 
-    H, W, D, T, N = [st.session_state.preprocessed[k] for k in ["H","W","D","T","N"]]
+    frames = st.session_state.preprocessed['edv_esv_frames']
+    raw_dia_idx = st.session_state.raw['raw_dia_idx']
+    raw_sys_idx = st.session_state.raw['raw_sys_idx']
+    H, W, D, T, N = [st.session_state.preprocessed[k] for k in ["H", "W", "D", "T", "N"]]
 
     disabled_flag = st.session_state.edv_esv_selected["confirmed"]
 
-    _, col_center,_ = st.columns([0.2,0.6,0.2])
+    _, col_center, _ = st.columns([0.2, 0.6, 0.2])
     with col_center:
-        col_edv, _, col_esv = st.columns([0.45,0.1,0.45])
+        col_edv, _, col_esv = st.columns([0.45, 0.1, 0.45])
 
         with col_edv:
-            dia_idx = frame_index_slider(T, frames, raw_dia_idx, 'EDV Index', disabled_flag, key = 'edv')
+            dia_idx = frame_index_slider(T, frames, raw_dia_idx, 'EDV Index', disabled_flag, key='edv')
 
         with col_esv:
-            sys_idx = frame_index_slider(T, frames, raw_sys_idx, 'ESV Index',disabled_flag, key = 'esv')
+            sys_idx = frame_index_slider(T, frames, raw_sys_idx, 'ESV Index', disabled_flag, key='esv')
 
         st.write('')
         if not disabled_flag:
@@ -717,11 +786,13 @@ def slice_navigation(D):
 
 
 def get_overlay(img_slice, mask_state, H, W, N, OVERLAY_COLORS):
-    overlay = Image.fromarray(np.stack([img_slice]*3, axis=-1)).convert("RGBA")
+    overlay = Image.fromarray(np.stack([img_slice] * 3, axis=-1)).convert("RGBA")
     for i in channels:
         ch_mask = mask_state[:, :, i]
         if np.any(ch_mask):
-            mask_img = np.zeros((H*st.session_state['subpixel_resolution'], W*st.session_state['subpixel_resolution'], 4), dtype=np.uint8)
+            mask_img = np.zeros(
+                (H * st.session_state['subpixel_resolution'], W * st.session_state['subpixel_resolution'], 4),
+                dtype=np.uint8)
             mask_img[ch_mask > 0] = OVERLAY_COLORS[i]
             overlay = Image.alpha_composite(overlay, Image.fromarray(mask_img))
     return overlay
@@ -729,11 +800,12 @@ def get_overlay(img_slice, mask_state, H, W, N, OVERLAY_COLORS):
 
 def select_brush(N):
     """Brush selection UI for channel, action, and stroke width."""
-    action = st.radio("Brush Stroke Selection", options=["Paint ✏️", "Erase ✂️"],  index=0, horizontal=True)
+    action = st.radio("Brush Stroke Selection", options=["Paint ✏️", "Erase ✂️"], index=0, horizontal=True)
     # stroke_width_map = {"1":5,"2":10,"3":20,"4":30,"5":60}
-    stroke_width_map = {"thin":6,"medium":20,"thick":40}
+    stroke_width_map = {"thin": 6, "medium": 20, "thick": 40}
 
-    stroke_width_sel = st.radio("Stroke width", options=list(stroke_width_map.keys()),  index= 0 if action == "Paint ✏️" else 2, horizontal=True)
+    stroke_width_sel = st.radio("Stroke width", options=list(stroke_width_map.keys()),
+                                index=0 if action == "Paint ✏️" else 2, horizontal=True)
     if action == "Paint ✏️":
         valid_channels = [i for i in range(N) if i != background_idx]
         channel = st.radio(
@@ -749,8 +821,8 @@ def select_brush(N):
     return channel, action, stroke_width
 
 
-def draw_segmentation(img_slice, mask_slice, H, W, N, OVERLAY_COLORS, stroke_width, stroke_color, action, d, idx, channel):
-
+def draw_segmentation(img_slice, mask_slice, H, W, N, OVERLAY_COLORS, stroke_width, stroke_color, action, d, idx,
+                      channel):
     if 'canvas' not in st.session_state:
         st.session_state['canvas'] = {
             'canvas_key': f'editor_{d}',
@@ -774,8 +846,8 @@ def draw_segmentation(img_slice, mask_slice, H, W, N, OVERLAY_COLORS, stroke_wid
         current_objects = canvas_result.json_data.get("objects", [])
 
     if (
-        d != st.session_state['canvas']['previous_d']
-        and st.session_state['canvas']['previous_objects']
+            d != st.session_state['canvas']['previous_d']
+            and st.session_state['canvas']['previous_objects']
     ):
         st.session_state['canvas']['canvas_key'] = f'editor_{d}'
         st.session_state['canvas']['previous_d'] = d
@@ -784,7 +856,7 @@ def draw_segmentation(img_slice, mask_slice, H, W, N, OVERLAY_COLORS, stroke_wid
 
     st.session_state['canvas']['previous_objects'] = current_objects
 
-    col1, col2= st.columns([1, 0.3])
+    col1, col2 = st.columns([1, 0.3])
     edited_mask = st.session_state['edited_mask']
 
     with col1:
@@ -826,7 +898,9 @@ def draw_segmentation(img_slice, mask_slice, H, W, N, OVERLAY_COLORS, stroke_wid
                 # Resize all masks once at the end to target size
                 for idx_color, channel in enumerate(overlay_channels):
                     resized_mask = np.array(
-                        Image.fromarray(combined_mask[:, :, idx_color]).resize((W*st.session_state['subpixel_resolution'], H*st.session_state['subpixel_resolution']), resample=Image.NEAREST)
+                        Image.fromarray(combined_mask[:, :, idx_color]).resize(
+                            (W * st.session_state['subpixel_resolution'], H * st.session_state['subpixel_resolution']),
+                            resample=Image.NEAREST)
                     )
 
                     # Clear affected pixels first
@@ -838,7 +912,7 @@ def draw_segmentation(img_slice, mask_slice, H, W, N, OVERLAY_COLORS, stroke_wid
 
     with col2:
         if st.button('Clear Slice', use_container_width=True):
-            edited_mask[:,:,d,idx,:] = 0
+            edited_mask[:, :, d, idx, :] = 0
             st.rerun()
 
 
@@ -860,7 +934,7 @@ def display_corrected_mask(image, image_slice, edited_mask, dia_idx, sys_idx, id
         gif = Image.open(edited_gif_path)
         frames = [frame.copy() for frame in ImageSequence.Iterator(gif)]
         st.session_state.gif_frames = frames
-        st.session_state['mask_hash']= current_hash
+        st.session_state['mask_hash'] = current_hash
 
     view_idx = 0 if idx_label == "End-Diastole" else 1
 
@@ -878,33 +952,32 @@ def mask_editor_view():
         st.error("Select and confirm EDV/ESV first.")
         st.stop()
 
-    H, W, D, T, N = [st.session_state.preprocessed[k] for k in ["H","W","D","T","N"]]
-    image=st.session_state.preprocessed["smooth_image"]
-    edited_mask=st.session_state['edited_mask']
-    dia_idx=st.session_state.edv_esv_selected["dia_idx"]
-    sys_idx=st.session_state.edv_esv_selected["sys_idx"]
+    H, W, D, T, N = [st.session_state.preprocessed[k] for k in ["H", "W", "D", "T", "N"]]
+    image = st.session_state.preprocessed["smooth_image"]
+    edited_mask = st.session_state['edited_mask']
+    dia_idx = st.session_state.edv_esv_selected["dia_idx"]
+    sys_idx = st.session_state.edv_esv_selected["sys_idx"]
 
-    col1, col2, col3 = st.columns([1,1.5,1.5])
+    col1, col2, col3 = st.columns([1, 1.5, 1.5])
 
     with col1:
         channel, action, stroke_width = select_brush(N)
         st.divider()
-        idx_label = st.radio("Frame", options=["End-Diastole","End-Systole"],  index = 0, horizontal=True)
+        idx_label = st.radio("Frame", options=["End-Diastole", "End-Systole"], index=0, horizontal=True)
         d = slice_navigation(D)
-        
-    
 
-    idx = dia_idx if idx_label=="End-Diastole" else sys_idx
-    img_slice = ((image[:,:,d,idx] - image[:,:,d,idx].min()) / (image[:,:,d,idx].max() - image[:,:,d,idx].min()) * 255).astype(np.uint8)
+    idx = dia_idx if idx_label == "End-Diastole" else sys_idx
+    img_slice = ((image[:, :, d, idx] - image[:, :, d, idx].min()) / (
+                image[:, :, d, idx].max() - image[:, :, d, idx].min()) * 255).astype(np.uint8)
 
     with col2:
-        edit_mode = st.radio('Segmentation Editor',['Editor','Viewer'], index=0, horizontal=True)
-        stroke_color = f"rgba{OVERLAY_COLORS[background_idx][:3]+(0.8,)}" if action == "Erase ✂️" else f"rgba{OVERLAY_COLORS[channel][:3]+(0.4,)}"
+        edit_mode = st.radio('Segmentation Editor', ['Editor', 'Viewer'], index=0, horizontal=True)
+        stroke_color = f"rgba{OVERLAY_COLORS[background_idx][:3] + (0.8,)}" if action == "Erase ✂️" else f"rgba{OVERLAY_COLORS[channel][:3] + (0.4,)}"
         if edit_mode == 'Viewer':
             st.image(img_slice, width=DISPLAY_W)
         else:
-            draw_segmentation(img_slice, edited_mask[:,:,d,idx,:], H, W, N, OVERLAY_COLORS, stroke_width, stroke_color, action, d, idx, channel)
+            draw_segmentation(img_slice, edited_mask[:, :, d, idx, :], H, W, N, OVERLAY_COLORS, stroke_width,
+                              stroke_color, action, d, idx, channel)
 
-        
     with col3:
         display_corrected_mask(image, img_slice, edited_mask, dia_idx, sys_idx, idx_label, edited_gif_path)
