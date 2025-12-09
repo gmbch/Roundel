@@ -754,7 +754,8 @@ def draw_segmentation(img_slice, mask_slice, H, W, N, OVERLAY_COLORS, stroke_wid
     if 'canvas' not in st.session_state:
         st.session_state['canvas'] = {
             'canvas_key': f'editor_{d}',
-            'previous_d': d
+            'previous_d': d,
+            'previous_objects': []
         }
 
     canvas_result = st_canvas(
@@ -768,15 +769,20 @@ def draw_segmentation(img_slice, mask_slice, H, W, N, OVERLAY_COLORS, stroke_wid
         key=st.session_state['canvas']['canvas_key']
     )
 
+    current_objects = []
+    if canvas_result is not None and canvas_result.json_data is not None:
+        current_objects = canvas_result.json_data.get("objects", [])
+
     if (
-        canvas_result is not None
-        and canvas_result.json_data is not None
-        and canvas_result.json_data.get("objects")
-        and d != st.session_state['canvas']['previous_d']
+        d != st.session_state['canvas']['previous_d']
+        and st.session_state['canvas']['previous_objects']
     ):
         st.session_state['canvas']['canvas_key'] = f'editor_{d}'
         st.session_state['canvas']['previous_d'] = d
+        st.session_state['canvas']['previous_objects'] = []
         st.rerun()
+
+    st.session_state['canvas']['previous_objects'] = current_objects
 
     col1, col2= st.columns([1, 0.3])
     edited_mask = st.session_state['edited_mask']
