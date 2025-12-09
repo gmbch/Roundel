@@ -81,7 +81,7 @@ def mini_divider():
 # --------------------------------------------------------------
 # Initialization
 # --------------------------------------------------------------
-def initialize_app(data_path, sax_series_uid, N, preprocess=True):
+def initialize_app(data_path, sax_series_uid, preprocess=True):
     
     # Store the last selected UID in session_state
     if "last_sax_uid" not in st.session_state:

@@ -20,7 +20,7 @@
 	],
 	// Enable plotting.
 	"containerEnv": {
-		"DISPLAY": "${localEnv:DISPLAY}"
+    "DISPLAY": "${localEnv:DISPLAY}"
 	},
 
 	// Configure tool-specific properties.

@@ -8,7 +8,7 @@ st.set_page_config(page_title="Roundel", page_icon="⭕️", layout='wide')
 # Data paths and series info
 # -----------------------------
 data_path = '/workspaces/Roundel/data/major_revisions'
-# data_path = '/workspaces/local/Roundel/data/test'
+# data_path = '/workspaces/Roundel/data/test'
 sax_series_uid_list = sorted([uid.replace('image___','').split('/')[-1].replace('.nii.gz','') for uid in glob.glob(f'{data_path}/*') if 'image' in uid and 'bi' not in uid])
 # Sidebar dropdown
 st.write('# Roundel App (2D)')
@@ -45,56 +45,51 @@ view = st.segmented_control(
 )
 st.divider()
 
-H, W, D, T, N = [st.session_state.preprocessed[k] for k in ["H","W","D","T","N"]]
-
 # --------------------------------------------------------------
 # EDV/ESV Finder 
 # --------------------------------------------------------------
 if view == "EDV/ESV Finder 🔍":
-    edv_esv_view(raw_curve_path = raw_curve_path, 
-                 frames= st.session_state.preprocessed['edv_esv_frames'],
-                 raw_dia_idx=st.session_state.raw['raw_dia_idx'], 
-                 raw_sys_idx=st.session_state.raw['raw_sys_idx'], 
-                 T = T, 
-                 edited_gif_path=edited_gif_path)
+    edv_esv_view()
 
 
 # --------------------------------------------------------------
 # Mask Editor 
 # --------------------------------------------------------------
 
+
 if view == "Mask Editor 📝":
-    mask_editor_view(
-        N=N, D=D, H=H, W=W,
-        image=st.session_state.preprocessed["image"],
-        edited_mask=st.session_state.edited_mask,
-        dia_idx=st.session_state.edv_esv_selected["dia_idx"],
-        sys_idx=st.session_state.edv_esv_selected["sys_idx"],
-        OVERLAY_COLORS=OVERLAY_COLORS,
-        edited_gif_path=edited_gif_path
-    )
+    try:
+        mask_editor_view()
+    except:
+        st.rerun()
 
 # --------------------------------------------------------------
 # Final Result
 # --------------------------------------------------------------
 
 if view == "Final Result ✅":
-    raw_image=st.session_state.raw['image']
-    raw_mask=st.session_state.raw['mask']
-    raw_edv = st.session_state.raw['raw_edv']
-    raw_esv = st.session_state.raw['raw_esv']
-    raw_mass = st.session_state.raw['raw_mass']
-    raw_ef = st.session_state.raw['raw_ef']
-    raw_shape=st.session_state.raw['shape']
-    preprocessed_image=st.session_state.preprocessed['image']
+    raw = st.session_state.raw
+    preprocessed = st.session_state.preprocessed
 
-    edited_mask=st.session_state.edited_mask
-    x_min, y_min, x_max, y_max =st.session_state.preprocessed['crop_box']
+    raw_image = raw["image"]
+    raw_mask = raw["mask"]
+    raw_edv = raw["raw_edv"]
+    raw_esv = raw["raw_esv"]
+    raw_mass = raw["raw_mass"]
+    raw_ef = raw["raw_ef"]
+    preprocessed_image = preprocessed["image"]
+    H, W, D, T, N = [preprocessed[k] for k in ["H","W","D","T","N"]]
+
+    edited_mask=st.session_state['edited_mask']
+    x_min, y_min, x_max, y_max = preprocessed['crop_box']
     dia_idx=st.session_state.edv_esv_selected['dia_idx']
     sys_idx=st.session_state.edv_esv_selected['sys_idx']
+    
     if not st.session_state.edv_esv_selected["confirmed"]:
         st.error("Select and confirm EDV/ESV first.")
         st.stop()
+
+    edited_mask = cv_zoom(edited_mask, zoom = [1/st.session_state['subpixel_resolution'],1/st.session_state['subpixel_resolution'],1,1])
 
     final_gif_path = f'results/gifs/{sax_series_uid}.gif'
     # Compute metrics
@@ -119,7 +114,7 @@ if view == "Final Result ✅":
         scale = 1.5
     )
 
-    col1, _, col2, col3 = st.columns([0.075, 0.05,0.2, 0.3])
+    col1, _, col2, col3 = st.columns([0.08, 0.05,0.2, 0.3])
     with col1:
         st.caption('Metrics')
         st.metric("End-Diastolic Volume", f"{edv:.1f} mL",
