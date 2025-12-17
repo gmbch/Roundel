@@ -462,7 +462,7 @@ def make_video(image, mask, save_file, mask_frames='all', scale=1):
 
         frames.append(canvas.convert("RGB"))
 
-    imageio.mimsave(save_file, frames, fps=timesteps / 2, loop=0)
+    imageio.mimsave(save_file, frames, fps=8, loop=0)
 
 
 def remake_gif_frames(
@@ -573,7 +573,7 @@ def remake_gif_frames(
 
         frames[t] = canvas.convert("RGB")
 
-    imageio.mimsave(output_gif, frames, fps=timesteps/2, loop=0)
+    imageio.mimsave(output_gif, frames, fps=8, loop=0)
 
 
 
