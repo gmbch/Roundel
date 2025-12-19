@@ -31,7 +31,6 @@ import pandas as pd
 import time
 import cv2
 
-
 os.makedirs('results/temp', exist_ok=True)
 os.makedirs('results/gifs', exist_ok=True)
 os.makedirs('results/masks', exist_ok=True)
@@ -68,7 +67,6 @@ edv_esv_gif_path = f'results/temp/edv_esv.gif'
 edited_gif_path = f'results/temp/edited_edv_esv.gif'
 raw_curve_path = f'results/temp/raw_metrics.png'
 edited_curve_path = f'results/temp/edited_metrics.png'
-
 
 def skip_case(study_uid, patient, study_date):
     """UI handler for skipping a case."""
@@ -132,6 +130,7 @@ def load_font(size):
 # Initialization
 # --------------------------------------------------------------
 def initialize_app(data_path, study_uid, pixelspacing, thickness, preprocess=True):
+    st.session_state['subpixel_resolution'] = 4
 
     # Store the last selected UID in session_state
     if "last_sax_uid" not in st.session_state:
@@ -200,7 +199,7 @@ def initialize_app(data_path, study_uid, pixelspacing, thickness, preprocess=Tru
     if "edv_esv_selected" not in st.session_state:
         st.session_state.edv_esv_selected = {"dia_idx": None, "sys_idx": None, "confirmed": False}
 
-    st.session_state['subpixel_resolution'] = 4
+    # st.session_state['subpixel_resolution'] = 4
     # -----------------------------
     # Preprocess / crop if required
     # -----------------------------
@@ -213,16 +212,16 @@ def initialize_app(data_path, study_uid, pixelspacing, thickness, preprocess=Tru
 
         has_masks = np.where(np.sum(preprocessed_mask[..., -1], axis=(0, 1, 3)) > 0)[0]
         mid_slice = len(has_masks) // 2
-        make_video(preprocessed_image[:, :, has_masks[mid_slice - 3:mid_slice + 3], :],
-                   preprocessed_mask[:, :, has_masks[mid_slice - 3:mid_slice + 3], :, :] * 0,
-                   save_file=edv_esv_gif_path)
 
-        smoothed_image = cv_zoom(preprocessed_image,
-                                 zoom=[st.session_state['subpixel_resolution'], st.session_state['subpixel_resolution'],
-                                       1, 1])
+        smoothed_image = cv_zoom(preprocessed_image, zoom=[st.session_state['subpixel_resolution'],
+                                                           st.session_state['subpixel_resolution'], 1, 1])
         smoothed_mask = smooth_zoom(preprocessed_mask, zoom=[st.session_state['subpixel_resolution'],
                                                              st.session_state['subpixel_resolution'], 1, 1, 1])
-        make_video(preprocessed_image, preprocessed_mask * 0, save_file=blank_gif_path)
+
+        make_video(smoothed_image[:, :, has_masks[mid_slice - 3:mid_slice + 3], :],
+                   smoothed_mask[:, :, has_masks[mid_slice - 3:mid_slice + 3], :, :] * 0,
+                   save_file=edv_esv_gif_path)
+        make_video(smoothed_image, smoothed_mask * 0, save_file=blank_gif_path)
 
         gif = Image.open(edv_esv_gif_path)
 
@@ -260,11 +259,16 @@ def initialize_app(data_path, study_uid, pixelspacing, thickness, preprocess=Tru
     # -----------------------------
     st.session_state['edited_mask'] = st.session_state.preprocessed["smooth_mask"].copy()
     st.session_state['mask_hash'] = mask_hash(st.session_state.preprocessed["mask"])
-    st.session_state.initialized_all = True
     st.session_state["view_mode"] = 'Static'
+    st.session_state["brush_mode"] = "Paint ✏️"
+    st.session_state["stroke_width"] = "thin"
+    st.session_state["edit_made"] = False
+    st.session_state['edited_frames'] = None
+
+    st.session_state.initialized_all = True
 
 
-def cv_zoom(images, zoom=[4, 4, 1, 1, 1], interpolation=cv2.INTER_CUBIC):
+def cv_zoom(images, zoom=[4,4,1,1,1], interpolation=cv2.INTER_CUBIC):
     """
     Resize height and width of a 4D or 5D array using OpenCV. Only H and W are scaled.
 
@@ -280,26 +284,23 @@ def cv_zoom(images, zoom=[4, 4, 1, 1, 1], interpolation=cv2.INTER_CUBIC):
 
     if images.ndim == 4:
         h, w, d, t = images.shape
-        resized = np.zeros((int(h * h_zoom), int(w * w_zoom), d, t), dtype=images.dtype)
+        resized = np.zeros((int(h*h_zoom), int(w*w_zoom), d, t), dtype=images.dtype)
         for z in range(d):
             for tau in range(t):
-                resized[..., z, tau] = cv2.resize(images[..., z, tau], (int(w * w_zoom), int(h * h_zoom)),
-                                                  interpolation=interpolation)
+                resized[..., z, tau] = cv2.resize(images[..., z, tau], (int(w*w_zoom), int(h*h_zoom)), interpolation=interpolation)
     elif images.ndim == 5:
         h, w, d, t, c = images.shape
-        resized = np.zeros((int(h * h_zoom), int(w * w_zoom), d, t, c), dtype=images.dtype)
+        resized = np.zeros((int(h*h_zoom), int(w*w_zoom), d, t, c), dtype=images.dtype)
         for z in range(d):
             for tau in range(t):
                 for ch in range(c):
-                    resized[..., z, tau, ch] = cv2.resize(images[..., z, tau, ch], (int(w * w_zoom), int(h * h_zoom)),
-                                                          interpolation=interpolation)
+                    resized[..., z, tau, ch] = cv2.resize(images[..., z, tau, ch], (int(w*w_zoom), int(h*h_zoom)), interpolation=interpolation)
     else:
         raise ValueError("Input must be 4D or 5D array.")
 
     return resized
 
-
-def smooth_zoom(mask, zoom=[4, 4, 1, 1, 1], sigma=5.0, to_discrete=True):
+def smooth_zoom(mask, zoom=[4,4,1,1,1], sigma=5.0, to_discrete=True):
     """
     Zoom a 4D or 5D categorical mask and smooth edges for visual appearance.
 
@@ -316,16 +317,16 @@ def smooth_zoom(mask, zoom=[4, 4, 1, 1, 1], sigma=5.0, to_discrete=True):
     zoomed = cv_zoom(mask.astype(np.float32), zoom, interpolation=cv2.INTER_CUBIC)
     dims = zoomed.ndim
     if dims == 4:
-        H, W, D, T = zoomed.shape
+        H,W,D,T = zoomed.shape
         for z in range(D):
             for t in range(T):
-                zoomed[..., z, t] = cv2.GaussianBlur(zoomed[..., z, t], (0, 0), sigmaX=sigma, sigmaY=sigma)
+                zoomed[..., z, t] = cv2.GaussianBlur(zoomed[..., z, t], (0,0), sigmaX=sigma, sigmaY=sigma)
     elif dims == 5:
-        H, W, D, T, C = zoomed.shape
+        H,W,D,T,C = zoomed.shape
         for z in range(D):
             for t in range(T):
                 for c in range(C):
-                    zoomed[..., z, t, c] = cv2.GaussianBlur(zoomed[..., z, t, c], (0, 0), sigmaX=sigma, sigmaY=sigma)
+                    zoomed[..., z, t, c] = cv2.GaussianBlur(zoomed[..., z, t, c], (0,0), sigmaX=sigma, sigmaY=sigma)
     else:
         raise ValueError("Mask must be 4D or 5D")
 
@@ -404,16 +405,18 @@ def make_video(image, mask, save_file, mask_frames='all', scale=1):
     #     font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", int(18 * scale))
     # except:
     #     font = ImageFont.load_default()
+    """***DON"T UPD***"""
     try:
         font = load_font(int(18 * scale))
     except:
         font = ImageFont.load_default()
+    """***DON"T UPD***"""
 
     frames = []
     if mask_frames == 'all':
         mask_frames = np.arange(timesteps)
 
-    for t in range(timesteps):
+    for t in mask_frames:
         canvas = Image.new(
             "RGBA",
             (grid_cols * W_scaled, grid_rows * H_scaled),
@@ -462,7 +465,6 @@ def make_video(image, mask, save_file, mask_frames='all', scale=1):
 
         frames.append(canvas.convert("RGB"))
 
-    # imageio.mimsave(save_file, frames, fps=8, loop=0)
     if timesteps < 5:
         fps = timesteps / 2
     else:
@@ -471,13 +473,13 @@ def make_video(image, mask, save_file, mask_frames='all', scale=1):
 
 
 def remake_gif_frames(
-    input_gif,
-    output_gif,
-    image,
-    mask,
-    redo_frames,
-    mask_frames="all",
-    scale=1
+        input_gif,
+        output_gif,
+        image,
+        mask,
+        redo_frames,
+        mask_frames="all",
+        scale=1
 ):
     gif_frames = imageio.mimread(input_gif)
     frames = [Image.fromarray(f).convert("RGB") for f in gif_frames]
@@ -521,9 +523,9 @@ def remake_gif_frames(
             row, col = divmod(idx, grid_cols)
 
             image_slice = (
-                (image[:, :, idx, t] - img_min)
-                / (img_max - img_min + 1e-9)
-                * 255
+                    (image[:, :, idx, t] - img_min)
+                    / (img_max - img_min + 1e-9)
+                    * 255
             ).astype(np.uint8)
 
             img_rgb = np.stack([image_slice] * 3, axis=-1)
@@ -578,7 +580,6 @@ def remake_gif_frames(
 
         frames[t] = canvas.convert("RGB")
 
-    # imageio.mimsave(output_gif, frames, fps=8, loop=0)
     if timesteps < 5:
         fps = timesteps / 2
     else:
@@ -871,6 +872,7 @@ def edv_esv_view():
             st.session_state.preprocessed["smooth_mask"],
             redo_frames=[dia_idx, sys_idx]
         )
+
         gif = Image.open(full_edited_gif_path)
         frames = [f.copy() for f in ImageSequence.Iterator(gif)]
         st.session_state['edited_frames'] = frames
@@ -879,7 +881,13 @@ def edv_esv_view():
 def slice_navigation(D):
     if "slice_idx" not in st.session_state:
         st.session_state.slice_idx = 0
+    if "previous_slice_idx" not in st.session_state:
+        st.session_state.previous_slice_idx = st.session_state.slice_idx
 
+    # Store previous slice
+    previous_d = st.session_state.previous_slice_idx
+
+    # Slider (updates slice_idx immediately)
     st.slider(
         "Slice Index",
         0,
@@ -888,7 +896,6 @@ def slice_navigation(D):
     )
 
     col_prev, col_next = st.columns(2)
-
     with col_prev:
         st.button(
             "Previous",
@@ -897,7 +904,6 @@ def slice_navigation(D):
             ),
             use_container_width=True,
         )
-
     with col_next:
         st.button(
             "Next",
@@ -907,11 +913,18 @@ def slice_navigation(D):
             use_container_width=True,
         )
 
-    return st.session_state.slice_idx
+    # Determine if canvas needs reset
+    previous_objects = st.session_state.get('canvas', {}).get('previous_objects', [])
+    reset_canvas = previous_d != st.session_state.slice_idx and bool(previous_objects)
+
+    # Update previous slice for next rerun
+    st.session_state.previous_slice_idx = st.session_state.slice_idx
+
+    return st.session_state.slice_idx, reset_canvas
 
 
 def get_overlay(image_slice, mask_state, H, W, N, OVERLAY_COLORS):
-    overlay = Image.fromarray(np.stack([image_slice]*3, axis=-1)).convert("RGBA")
+    overlay = Image.fromarray(np.stack([image_slice] * 3, axis=-1)).convert("RGBA")
     for i in channels:
         ch_mask = mask_state[:, :, i]
         if np.any(ch_mask):
@@ -925,12 +938,19 @@ def get_overlay(image_slice, mask_state, H, W, N, OVERLAY_COLORS):
 
 def select_brush(N):
     """Brush selection UI for channel, action, and stroke width."""
-    action = st.radio("Brush Stroke Selection", options=["Paint ✏️", "Erase ✂️"], index=0, horizontal=True)
-    # stroke_width_map = {"1":5,"2":10,"3":20,"4":30,"5":60}
+    action = st.radio("Brush Stroke Selection",
+                      options=["Paint ✏️", "Erase ✂️"],
+                      index=["Paint ✏️", "Erase ✂️"].index(st.session_state.brush_mode),
+                      horizontal=True)
+    st.session_state['brush_mode'] = action
     stroke_width_map = {"thin": 6, "medium": 20, "thick": 40}
 
-    stroke_width_sel = st.radio("Stroke width", options=list(stroke_width_map.keys()),
-                                index=0 if action == "Paint ✏️" else 2, horizontal=True)
+    stroke_width_sel = st.radio("Stroke width",
+                                options=list(stroke_width_map.keys()),
+                                index=list(stroke_width_map.keys()).index(st.session_state["stroke_width"]),
+                                horizontal=True)
+    st.session_state['stroke_width'] = stroke_width_sel
+
     if action == "Paint ✏️":
         valid_channels = [i for i in range(N) if i != background_idx]
         channel = st.radio(
@@ -940,6 +960,7 @@ def select_brush(N):
             index=0,
             horizontal=True
         )
+
     else:
         channel = 0
     stroke_width = stroke_width_map[stroke_width_sel]
@@ -947,7 +968,7 @@ def select_brush(N):
 
 
 def mask_editor_view():
-    """Full Mask Editor layout."""
+    """Efficient Mask Editor with controlled reruns and canvas caching."""
     if not st.session_state.edv_esv_selected["confirmed"]:
         st.error("Select and confirm EDV/ESV first.")
         st.stop()
@@ -963,26 +984,36 @@ def mask_editor_view():
     with col1:
         channel, action, stroke_width = select_brush(N)
         st.divider()
-        idx_label = st.radio("Frame", options=["End-Diastole", "End-Systole"], index=0, horizontal=True)
-        d = slice_navigation(D)
+        idx_label = st.radio("Frame", ["End-Diastole", "End-Systole"], index=0, horizontal=True)
+        d, reset_canvas = slice_navigation(D)
 
     idx = dia_idx if idx_label == "End-Diastole" else sys_idx
-    image_slice = ((image[:, :, d, idx] - image[:, :, d, idx].min()) / (
-                image[:, :, d, idx].max() - image[:, :, d, idx].min()) * 255).astype(np.uint8)
+
+    # Normalize slice once per display
+    img_slice = image[:, :, d, idx]
+    image_slice = ((img_slice - img_slice.min()) / (img_slice.max() - img_slice.min()) * 255).astype(np.uint8)
     mask_slice = edited_mask[:, :, d, idx, :]
 
     with col2:
         edit_mode = st.radio('Segmentation Editor', ['Editor', 'Viewer'], index=0, horizontal=True)
         stroke_color = f"rgba{OVERLAY_COLORS[background_idx][:3] + (0.8,)}" if action == "Erase ✂️" else f"rgba{OVERLAY_COLORS[channel][:3] + (0.4,)}"
+
         if edit_mode == 'Viewer':
             st.image(image_slice, width=DISPLAY_W)
         else:
+            # Initialize canvas state
             if 'canvas' not in st.session_state:
                 st.session_state['canvas'] = {
                     'canvas_key': f'editor_{d}',
                     'previous_d': d,
                     'previous_objects': []
                 }
+
+            if reset_canvas:
+                st.session_state['canvas']['canvas_key'] = f'editor_{d}'
+                st.session_state['canvas']['previous_objects'] = []
+
+            st.session_state['canvas']['previous_d'] = d
 
             canvas_result = st_canvas(
                 stroke_width=stroke_width,
@@ -995,93 +1026,70 @@ def mask_editor_view():
                 key=st.session_state['canvas']['canvas_key']
             )
 
+            # Track current objects
             current_objects = []
-            if canvas_result is not None and canvas_result.json_data is not None:
+            if canvas_result and canvas_result.json_data:
                 current_objects = canvas_result.json_data.get("objects", [])
-
-            if (
-                    d != st.session_state['canvas']['previous_d']
-                    and st.session_state['canvas']['previous_objects']
-            ):
-                st.session_state['canvas']['canvas_key'] = f'editor_{d}'
-                st.session_state['canvas']['previous_d'] = d
-                st.session_state['canvas']['previous_objects'] = []
-                st.rerun()
-
             st.session_state['canvas']['previous_objects'] = current_objects
 
-            col1, col2 = st.columns([1, 0.3])
-            edited_mask = st.session_state['edited_mask']
-
-            with col1:
+            # Save / clear buttons (trigger rerun only here)
+            col_save, col_clear = st.columns([1, 0.3])
+            with col_save:
                 save_contour = st.button('Save Contour', type='primary', use_container_width=True)
-                if canvas_result and canvas_result.image_data is not None:
-                    objects = canvas_result.json_data.get("objects", [])
-                    if save_contour and objects:
-                        # Original canvas image
-                        brush_data = np.array(canvas_result.image_data)  # Hc x Wc x 4 (RGBA)
-                        rgb = brush_data[:, :, :3].astype(np.float32)
-                        alpha = brush_data[:, :, 3].astype(np.float32) / 255.0
+                if save_contour and canvas_result and canvas_result.image_data is not None and current_objects:
+                    brush_data = np.array(canvas_result.image_data)
+                    rgb = brush_data[:, :, :3].astype(np.float32)
+                    alpha = brush_data[:, :, 3].astype(np.float32) / 255.0
 
-                        overlay_colors_list = np.array([color[:3] for color in OVERLAY_COLORS.values()],
-                                                       dtype=np.float32)
-                        overlay_channels = list(OVERLAY_COLORS.keys())
+                    overlay_colors_list = np.array([color[:3] for color in OVERLAY_COLORS.values()], dtype=np.float32)
+                    overlay_channels = list(OVERLAY_COLORS.keys())
 
-                        h, w, _ = rgb.shape
-                        rgb_flat = rgb.reshape(-1, 3)
-                        alpha_flat = alpha.flatten()
+                    h, w, _ = rgb.shape
+                    rgb_flat = rgb.reshape(-1, 3)
+                    alpha_flat = alpha.flatten()
+                    distances = np.linalg.norm(rgb_flat[:, None, :] - overlay_colors_list[None, :, :], axis=-1)
+                    closest_idx = np.argmin(distances, axis=1)
 
-                        # Map each pixel to closest overlay color
-                        distances = np.linalg.norm(rgb_flat[:, None, :] - overlay_colors_list[None, :, :], axis=-1)
-                        closest_idx = np.argmin(distances, axis=1)
+                    mask_flat = np.zeros((h * w, len(overlay_channels)), dtype=np.uint8)
+                    for idx_color, ch in enumerate(overlay_channels):
+                        mask_flat[:, idx_color] = ((closest_idx == idx_color) & (alpha_flat > 0)).astype(np.uint8)
 
-                        # Prepare masks at canvas resolution
-                        mask_flat = np.zeros((h * w, len(overlay_channels)), dtype=np.uint8)
-                        for idx_color, channel in enumerate(overlay_channels):
-                            mask_flat[:, idx_color] = ((closest_idx == idx_color) & (alpha_flat > 0)).astype(np.uint8)
+                    masks = []
+                    for idx_color, ch in enumerate(overlay_channels):
+                        mask_bool = mask_flat[:, idx_color].reshape(h, w)
+                        mask_bool = thicken_close_fill_and_smooth(mask_bool, stroke_width)
+                        masks.append(mask_bool)
 
-                        # Reshape masks and apply stroke thickening
-                        masks = []
-                        for idx_color, channel in enumerate(overlay_channels):
-                            mask_bool = mask_flat[:, idx_color].reshape(h, w)
-                            mask_bool = thicken_close_fill_and_smooth(mask_bool, stroke_width)
-                            masks.append(mask_bool)
+                    combined_mask = np.stack(masks, axis=-1)
+                    for idx_color, ch in enumerate(overlay_channels):
+                        resized_mask = np.array(
+                            Image.fromarray(combined_mask[:, :, idx_color]).resize(
+                                (W * st.session_state['subpixel_resolution'],
+                                 H * st.session_state['subpixel_resolution']),
+                                resample=Image.NEAREST
+                            )
+                        )
+                        edited_mask[:, :, d, idx, :][resized_mask > 0] = 0
+                        edited_mask[:, :, d, idx, ch][resized_mask > 0] = 1
 
-                        # Combine all masks into a single array at canvas resolution
-                        combined_mask = np.stack(masks, axis=-1)  # Hc x Wc x num_channels
+                    st.session_state['edit_made'] = True
+                    st.rerun()
+                else:
+                    st.rerun()
 
-                        # Resize all masks once at the end to target size
-                        for idx_color, channel in enumerate(overlay_channels):
-                            resized_mask = np.array(Image.fromarray(combined_mask[:, :, idx_color]).resize((W *
-                                                                                                            st.session_state[
-                                                                                                                'subpixel_resolution'],
-                                                                                                            H *
-                                                                                                            st.session_state[
-                                                                                                                'subpixel_resolution']),
-                                                                                                           resample=Image.NEAREST))
-
-                            # Clear affected pixels first
-                            edited_mask[:, :, d, idx, :][resized_mask > 0] = 0
-                            # Apply current channel
-                            edited_mask[:, :, d, idx, channel][resized_mask > 0] = 1
-                        st.rerun()
-
-            with col2:
+            with col_clear:
                 if st.button('Clear Slice', use_container_width=True):
                     edited_mask[:, :, d, idx, :] = 0
+                    st.session_state['edit_made'] = True
                     st.rerun()
 
     with col3:
-        view_mode = st.radio(
-            'Corrected Mask',
-            ['Static', 'GIF', 'Viewer'],
-            index=['Static', 'GIF', 'Viewer'].index(st.session_state["view_mode"]),
-            horizontal=True
-        )
+        view_mode = st.radio('Corrected Mask', ['Static', 'GIF', 'Viewer'],
+                             index=['Static', 'GIF', 'Viewer'].index(st.session_state["view_mode"]),
+                             horizontal=True)
         st.session_state["view_mode"] = view_mode
 
-        current_hash = hashlib.md5(edited_mask.tobytes()).hexdigest()
-        if st.session_state.get('mask_hash', None) != current_hash:
+        if st.session_state.get('edited_frames') is None or st.session_state["edit_made"]:
             remake_gif_frames(
                 full_edited_gif_path,
                 full_edited_gif_path,
@@ -1089,13 +1097,12 @@ def mask_editor_view():
                 edited_mask,
                 redo_frames=[dia_idx, sys_idx]
             )
-            st.session_state.mask_hash = current_hash
             gif = Image.open(full_edited_gif_path)
-            frames = [f.copy() for f in ImageSequence.Iterator(gif)]
-            st.session_state['edited_frames'] = frames
+            st.session_state['edited_frames'] = [f.copy() for f in ImageSequence.Iterator(gif)]
+            st.session_state['edit_made'] = False
 
         if st.session_state["view_mode"] == "Static":
-            st.image(st.session_state["edited_frames"][idx])
+            st.image(st.session_state['edited_frames'][idx])
         elif st.session_state["view_mode"] == "GIF":
             st.image(full_edited_gif_path)
         else:
