@@ -46,6 +46,17 @@ case_item   = selected_case
 study_uid   = case_item["study_uid"]
 patient     = case_item.get("fid")
 study_date  = case_item.get("study_date")
+sagemaker_flags  = case_item.get("sm_flags")
+gif_url = case_item.get('gif_url')
+pipeline_edv = case_item.get('edv', '')
+pipeline_esv = case_item.get('esv', '')
+pipeline_mass = case_item.get('mass', '')
+
+if not gif_url.startswith("http"):
+    gif_url = f"https://{gif_url}"
+
+
+comments  = case_item.get("comments")
 description = case_item.get("description", "Unknown")
 
 pixelspacing = float(case_item["pixelspacing"])
@@ -66,7 +77,12 @@ with col2:
     # Display metadata in the app
     st.markdown(f"**🟢 {len(cases)} total staged cases**")
     st.markdown(f"**Study UID:** {study_uid} | **FID:** {patient} | **Study Date:** {study_date}")
+    st.markdown(f"**Flags from SageMaker:** {sagemaker_flags}")
+    st.markdown(f"**SageMaker Comments:** {comments}")
     st.markdown(f"**Description:** {description} | **Pixel Size**: {pixelspacing} x {pixelspacing}mm | **Slice Thickness**: {thickness} mm")
+    st.markdown(f"**Pipeline: EDV**: {pipeline_edv:.1f} mL | **ESV**: {pipeline_esv:.1f} mL | **Mass**: {pipeline_mass:.1f} g")
+    st.markdown(f"[📥 Download Segmentation GIF]({gif_url})")
+
 
     # --- Skip Case Button ---
     if st.button("⏭️ Skip Case (Artifacts Too Heavy)", type="secondary", use_container_width=True):
@@ -76,16 +92,12 @@ with col2:
 # App
 # --------------------------------------------------------------
 
-# If the save flow set a next default tab, use it
-if "next_view" in st.session_state:
-    st.session_state["view"] = st.session_state.pop("next_view")
-
-
 view = st.radio(
-    "Tab",
-    options=["EDV/ESV Finder 🔍", "Mask Editor 📝", "Final Result ✅"],
+    "",
+    ["EDV/ESV Finder 🔍", "Mask Editor 📝", "Final Result ✅"],
+    index=0,
     horizontal=True,
-    key="view"
+    label_visibility="collapsed",
 )
 
 st.divider()
@@ -102,10 +114,10 @@ if view == "EDV/ESV Finder 🔍":
 
 
 if view == "Mask Editor 📝":
-    try:
-        mask_editor_view()
-    except:
-        st.rerun()
+    # try:
+    mask_editor_view()
+    # except:
+    #     st.rerun()
 
 # --------------------------------------------------------------
 # Final Result
@@ -147,15 +159,17 @@ if view == "Final Result ✅":
     final_mask_2d = np.argmax(final_mask_2d, -1)
 
     make_video(
-        preprocessed_image[:, :, :, [dia_idx, sys_idx]],
-        edited_mask[:, :, :, [dia_idx, sys_idx], :],
+        preprocessed_image,
+        edited_mask,
+        mask_frames=[dia_idx, sys_idx],
         save_file=edited_gif_path
     )
 
     make_video(
-        raw_image[:, :, :, [dia_idx, sys_idx]],
-        np.eye(N, dtype=np.uint8)[final_mask_2d][:, :, :, [dia_idx, sys_idx], :],
+        raw_image,
+        np.eye(N, dtype=np.uint8)[final_mask_2d],
         save_file=final_gif_path,
+        mask_frames=[dia_idx, sys_idx],
         scale=1.5
     )
 

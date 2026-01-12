@@ -5,7 +5,8 @@ import hashlib
 import shutil
 from pathlib import Path
 import io
-
+import json
+from pathlib import Path
 import nibabel as nib
 import numpy as np
 import imageio.v2 as imageio
@@ -31,14 +32,24 @@ import pandas as pd
 import time
 import cv2
 
+blank_gif_path = f'results/temp/blank.gif'
+full_edited_gif_path = f'results/temp/edited.gif'
+preprocessed_gif_path = f'results/temp/preprocessed.gif'
+edv_esv_gif_path = f'results/temp/edv_esv.gif'
+edited_gif_path = f'results/temp/edited_edv_esv.gif'
+raw_curve_path = f'results/temp/raw_metrics.png'
+edited_curve_path = f'results/temp/edited_metrics.png'
+cache_dir = 'cache'
+
 os.makedirs('results/temp', exist_ok=True)
 os.makedirs('results/gifs', exist_ok=True)
 os.makedirs('results/masks', exist_ok=True)
 os.makedirs('results/edited_sax_df', exist_ok=True)
+os.makedirs(cache_dir, exist_ok=True)
 
 GIF_W = 150
-DISPLAY_H = DISPLAY_W = 400
-BACKGROUND_COLOR = (30, 30, 30, 0)
+DISPLAY_W = 400
+BACKGROUND_COLOR = (100, 100, 0, 0)
 LV_MYO_COLOR = (0, 255, 255, 50) # Blue
 LV_COLOR = (255, 10, 10, 50)      # Red
 
@@ -49,8 +60,8 @@ lv_idx = 2
 channels = [lv_myo_idx, lv_idx]
 
 BRUSH_LABELS = {
-    lv_myo_idx: 'LV Myocardium 🔵',
-    lv_idx: 'LV Blood Pool 🔴',
+    lv_myo_idx: 'Myocardium 🔵',
+    lv_idx: 'Blood Pool 🔴',
 }
 
 
@@ -60,13 +71,25 @@ OVERLAY_COLORS = {
     lv_idx: LV_COLOR,
 }
 
-blank_gif_path = f'results/temp/blank.gif'
-full_edited_gif_path = f'results/temp/edited.gif'
-preprocessed_gif_path = f'results/temp/preprocessed.gif'
-edv_esv_gif_path = f'results/temp/edv_esv.gif'
-edited_gif_path = f'results/temp/edited_edv_esv.gif'
-raw_curve_path = f'results/temp/raw_metrics.png'
-edited_curve_path = f'results/temp/edited_metrics.png'
+
+def save_config(config: dict, path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        json.dump(config, f, indent=2)
+
+
+def load_config(path) -> dict:
+    path = Path(path)
+    with path.open("r") as f:
+        return json.load(f)
+
+
+def save_mask(mask, save_path):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    nib_mask = nib.Nifti1Image(mask, affine=np.eye(4), dtype='uint8')
+    nib.save(nib_mask, save_path)
+
 
 def skip_case(study_uid, patient, study_date):
     """UI handler for skipping a case."""
@@ -126,11 +149,15 @@ def load_font(size):
     # Fallback (non scalable)
     return ImageFont.load_default()
 
+
 # --------------------------------------------------------------
 # Initialization
 # --------------------------------------------------------------
 def initialize_app(data_path, study_uid, pixelspacing, thickness, preprocess=True):
-    st.session_state['subpixel_resolution'] = 4
+    st.session_state['data_path'] = data_path
+    st.session_state['study_uid'] = study_uid
+
+    os.makedirs(f'{data_path}/cache', exist_ok=True)
 
     # Store the last selected UID in session_state
     if "last_sax_uid" not in st.session_state:
@@ -194,81 +221,86 @@ def initialize_app(data_path, study_uid, pixelspacing, thickness, preprocess=Tru
     }
 
     # -----------------------------
-    # Initialize EDV/ESV selection
+    # Initialize EDV|ESV selection
     # -----------------------------
     if "edv_esv_selected" not in st.session_state:
         st.session_state.edv_esv_selected = {"dia_idx": None, "sys_idx": None, "confirmed": False}
 
-    # st.session_state['subpixel_resolution'] = 4
     # -----------------------------
     # Preprocess / crop if required
     # -----------------------------
-    if preprocess:
-        x_min, y_min, x_max, y_max = find_crop_box(np.max(raw_mask[..., [lv_idx, lv_myo_idx]], axis=(-1, -2, -3)),
-                                                   crop_factor=1.5)
-        preprocessed_image = raw_image[y_min:y_max, x_min:x_max, :, :]
-        preprocessed_mask = raw_mask[y_min:y_max, x_min:x_max, :, :, :].astype('uint8')
-        H, W, D, T, N = preprocessed_mask.shape
+    x_min, y_min, x_max, y_max = find_crop_box(np.max(raw_mask[..., [lv_idx, lv_myo_idx]], axis=(-1, -2, -3)),
+                                               crop_factor=1.5)
 
-        has_masks = np.where(np.sum(preprocessed_mask[..., -1], axis=(0, 1, 3)) > 0)[0]
-        mid_slice = len(has_masks) // 2
+    subpixel_resolution = 500 // (y_max - y_min)
+    subpixel_resolution = min(4, subpixel_resolution)
+    st.session_state['subpixel_resolution'] = subpixel_resolution
 
-        smoothed_image = cv_zoom(preprocessed_image, zoom=[st.session_state['subpixel_resolution'],
-                                                           st.session_state['subpixel_resolution'], 1, 1])
-        smoothed_mask = smooth_zoom(preprocessed_mask, zoom=[st.session_state['subpixel_resolution'],
-                                                             st.session_state['subpixel_resolution'], 1, 1, 1])
+    preprocessed_image = raw_image[y_min:y_max, x_min:x_max, :, :]
+    preprocessed_mask = raw_mask[y_min:y_max, x_min:x_max, :, :, :].astype('uint8')
+    H, W, D, T, N = preprocessed_mask.shape
 
-        make_video(smoothed_image[:, :, has_masks[mid_slice - 3:mid_slice + 3], :],
-                   smoothed_mask[:, :, has_masks[mid_slice - 3:mid_slice + 3], :, :] * 0,
-                   save_file=edv_esv_gif_path)
-        make_video(smoothed_image, smoothed_mask * 0, save_file=blank_gif_path)
+    has_masks = np.where(np.sum(preprocessed_mask[..., -1], axis=(0, 1, 3)) > 0)[0]
+    mid_slice = len(has_masks) // 2
 
-        gif = Image.open(edv_esv_gif_path)
+    zoom = [st.session_state['subpixel_resolution'], st.session_state['subpixel_resolution'], 1, 1]
 
-        st.session_state.preprocessed = {
-            "image": preprocessed_image,
-            "mask": preprocessed_mask,
-            "smooth_image": smoothed_image,
-            "smooth_mask": smoothed_mask,
-            "H": H, "W": W, "D": D, "T": T, "N": N,
-            "edv_esv_frames": [frame.copy() for frame in ImageSequence.Iterator(gif)],
-            'crop_box': [x_min, y_min, x_max, y_max]
-        }
+    smoothed_image = cv_zoom(preprocessed_image, zoom=zoom)
 
+    st.session_state['cache_config_path'] = f"{cache_dir}/config___{study_uid}.json"
+    st.session_state['cache_mask_path'] = f"{cache_dir}/masks___{study_uid}.nii.gz"
+
+    if os.path.exists(st.session_state['cache_config_path']) and os.path.exists(st.session_state['cache_mask_path']):
+        smoothed_mask = load_nii(st.session_state['cache_mask_path']).astype("uint8")
+        cached = True
     else:
-        st.session_state['subpixel_resolution'] = 1
-        st.session_state.preprocessed = {
-            "image": raw_image,
-            "mask": raw_mask,
-            "H": raw_shape[0], "W": raw_shape[1], "D": raw_shape[2], "T": raw_shape[3], "N": N,
-            'crop_box': [0, 0, raw_image.shape[0], raw_image.shape[1]]
+        smoothed_mask = cv_zoom_mask(
+            preprocessed_mask,
+            zoom=zoom + [1],
+            interpolation=cv2.INTER_NEAREST,
+        )
+        cached = False
 
-        }
+    make_video(smoothed_image[:, :, has_masks[mid_slice - 3:mid_slice + 3], :],
+               smoothed_mask[:, :, has_masks[mid_slice - 3:mid_slice + 3], :, :] * 0, save_file=edv_esv_gif_path)
+    make_video(smoothed_image, smoothed_mask * 0, save_file=blank_gif_path)
 
-    # # -----------------------------
-    # # Plot raw curve
-    # # -----------------------------
-    # plot_volume_curve(
-    #     raw_volume, raw_volume,
-    #     raw_dia_idx, raw_sys_idx, raw_dia_idx, raw_sys_idx,
-    #     save_path=raw_curve_path
-    # )
+    gif = Image.open(edv_esv_gif_path)
+
+    st.session_state.preprocessed = {
+        "image": preprocessed_image,
+        "mask": preprocessed_mask,
+        "smooth_image": smoothed_image,
+        "smooth_mask": smoothed_mask,
+        "H": H,
+        "W": W,
+        "D": D,
+        "T": T,
+        "N": N,
+        "edv_esv_frames": [frame.copy() for frame in ImageSequence.Iterator(gif)],
+        "crop_box": [x_min, y_min, x_max, y_max],
+    }
+
+    if cached:
+        config = load_config(st.session_state['cache_config_path'])
+        confirm_selection(dia_idx=config['dia_idx'], sys_idx=config['sys_idx'])
 
     # -----------------------------
     # Initialize edited mask
     # -----------------------------
     st.session_state['edited_mask'] = st.session_state.preprocessed["smooth_mask"].copy()
+    save_mask(st.session_state['edited_mask'], save_path=st.session_state['cache_mask_path'])
     st.session_state['mask_hash'] = mask_hash(st.session_state.preprocessed["mask"])
-    st.session_state["view_mode"] = 'Static'
     st.session_state["brush_mode"] = "Paint ✏️"
     st.session_state["stroke_width"] = "thin"
     st.session_state["edit_made"] = False
     st.session_state['edited_frames'] = None
+    st.session_state['cached'] = cached
 
     st.session_state.initialized_all = True
 
 
-def cv_zoom(images, zoom=[4,4,1,1,1], interpolation=cv2.INTER_CUBIC):
+def cv_zoom(images, zoom, interpolation=cv2.INTER_CUBIC):
     """
     Resize height and width of a 4D or 5D array using OpenCV. Only H and W are scaled.
 
@@ -284,57 +316,56 @@ def cv_zoom(images, zoom=[4,4,1,1,1], interpolation=cv2.INTER_CUBIC):
 
     if images.ndim == 4:
         h, w, d, t = images.shape
-        resized = np.zeros((int(h*h_zoom), int(w*w_zoom), d, t), dtype=images.dtype)
+        resized = np.zeros((int(h * h_zoom), int(w * w_zoom), d, t), dtype=images.dtype)
         for z in range(d):
             for tau in range(t):
-                resized[..., z, tau] = cv2.resize(images[..., z, tau], (int(w*w_zoom), int(h*h_zoom)), interpolation=interpolation)
+                resized[..., z, tau] = cv2.resize(images[..., z, tau], (int(w * w_zoom), int(h * h_zoom)),
+                                                  interpolation=interpolation)
     elif images.ndim == 5:
         h, w, d, t, c = images.shape
-        resized = np.zeros((int(h*h_zoom), int(w*w_zoom), d, t, c), dtype=images.dtype)
+        resized = np.zeros((int(h * h_zoom), int(w * w_zoom), d, t, c), dtype=images.dtype)
         for z in range(d):
             for tau in range(t):
                 for ch in range(c):
-                    resized[..., z, tau, ch] = cv2.resize(images[..., z, tau, ch], (int(w*w_zoom), int(h*h_zoom)), interpolation=interpolation)
+                    resized[..., z, tau, ch] = cv2.resize(images[..., z, tau, ch], (int(w * w_zoom), int(h * h_zoom)),
+                                                          interpolation=interpolation)
     else:
         raise ValueError("Input must be 4D or 5D array.")
 
     return resized
 
-def smooth_zoom(mask, zoom=[4,4,1,1,1], sigma=5.0, to_discrete=True):
+
+def cv_zoom_mask(
+        mask,
+        zoom,
+        sigma=2.0,
+        interpolation=cv2.INTER_CUBIC,
+):
     """
-    Zoom a 4D or 5D categorical mask and smooth edges for visual appearance.
-
-    Args:
-        mask (np.ndarray): Input mask of shape H,W,D,T or H,W,D,T,C
-        zoom (list): Zoom factors for H,W,D,T,(C). Only H and W >1
-        sigma (float): Gaussian blur sigma
-        to_discrete (bool): If True, round blurred mask back to original integer labels
-
-    Returns:
-        np.ndarray: Zoomed and smoothed mask
+    mask: H,W,D,T,C
+    returns: H,W,D,T,C one-hot
     """
-    # Step 1: Zoom with nearest-neighbor to preserve labels
-    zoomed = cv_zoom(mask.astype(np.float32), zoom, interpolation=cv2.INTER_CUBIC)
-    dims = zoomed.ndim
-    if dims == 4:
-        H,W,D,T = zoomed.shape
-        for z in range(D):
-            for t in range(T):
-                zoomed[..., z, t] = cv2.GaussianBlur(zoomed[..., z, t], (0,0), sigmaX=sigma, sigmaY=sigma)
-    elif dims == 5:
-        H,W,D,T,C = zoomed.shape
-        for z in range(D):
-            for t in range(T):
-                for c in range(C):
-                    zoomed[..., z, t, c] = cv2.GaussianBlur(zoomed[..., z, t, c], (0,0), sigmaX=sigma, sigmaY=sigma)
-    else:
-        raise ValueError("Mask must be 4D or 5D")
 
-    # Step 2: Optionally convert back to integer labels
-    if to_discrete:
-        zoomed = np.rint(zoomed).astype(mask.dtype)
+    zoomed = cv_zoom(mask.astype(np.float32), zoom, interpolation=interpolation)
 
-    return zoomed
+    myo = (zoomed[..., lv_myo_idx] > 0.5).astype(np.float32)
+    endo = (zoomed[..., lv_idx] > 0.5).astype(np.float32)
+
+    epi = np.zeros_like(myo, dtype=bool)
+    for d in range(myo.shape[2]):
+        for t in range(myo.shape[3]):
+            epi[..., d, t] = binary_fill_holes(myo[..., d, t].astype(np.uint8))
+
+    epi = gaussian_filter(epi.astype(np.float32), sigma=(sigma, sigma, 0, 0)) > 0.5
+    endo = gaussian_filter(endo.astype(np.float32), sigma=(sigma, sigma, 0, 0)) > 0.5
+
+    # Encode labels: 0=bg, 1=endo, 2=myo
+    labels = np.zeros(epi.shape, dtype=np.uint8)
+    labels[epi] = lv_myo_idx
+    labels[endo] = lv_idx
+
+    # One-hot
+    return np.eye(3, dtype=np.uint8)[labels]
 
 
 def mask_hash(mask_array):
@@ -390,6 +421,9 @@ def thicken_close_fill_and_smooth(strokes, stroke_width):
 
 
 def make_video(image, mask, save_file, mask_frames='all', scale=1):
+    save_file = Path(save_file)
+    save_file.parent.mkdir(parents=True, exist_ok=True)
+
     position = image.shape[2]
     timesteps = image.shape[3]
 
@@ -401,16 +435,10 @@ def make_video(image, mask, save_file, mask_frames='all', scale=1):
     H_scaled, W_scaled = round(GIF_H * scale), round(GIF_W * scale)
     img_min, img_max = np.min(image), np.max(image)
 
-    # try:
-    #     font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", int(18 * scale))
-    # except:
-    #     font = ImageFont.load_default()
-    """***DON"T UPD***"""
     try:
         font = load_font(int(18 * scale))
     except:
         font = ImageFont.load_default()
-    """***DON"T UPD***"""
 
     frames = []
     if mask_frames == 'all':
@@ -465,126 +493,11 @@ def make_video(image, mask, save_file, mask_frames='all', scale=1):
 
         frames.append(canvas.convert("RGB"))
 
-    if timesteps < 5:
-        fps = timesteps / 2
+    if len(mask_frames) < 5:
+        fps = len(mask_frames) / 2
     else:
-        fps = np.clip(timesteps / 2, 8, 15)
+        fps = np.clip(len(mask_frames) / 2, 8, 15)
     imageio.mimsave(save_file, frames, fps=fps, loop=0)
-
-
-def remake_gif_frames(
-        input_gif,
-        output_gif,
-        image,
-        mask,
-        redo_frames,
-        mask_frames="all",
-        scale=1
-):
-    gif_frames = imageio.mimread(input_gif)
-    frames = [Image.fromarray(f).convert("RGB") for f in gif_frames]
-
-    position = image.shape[2]
-    timesteps = image.shape[3]
-
-    grid_rows = int(np.sqrt(position) + 0.5)
-    grid_cols = (position + grid_rows - 1) // grid_rows
-
-    H, W = image.shape[:2]
-    GIF_W = frames[0].width // grid_cols
-    GIF_H = frames[0].height // grid_rows
-
-    H_scaled = round(GIF_H * scale)
-    W_scaled = round(GIF_W * scale)
-
-    img_min = np.min(image)
-    img_max = np.max(image)
-
-    try:
-        font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            int(18 * scale),
-        )
-    except:
-        font = ImageFont.load_default()
-
-    if mask_frames == "all":
-        mask_frames = np.arange(timesteps)
-
-    for t in redo_frames:
-        canvas = Image.new(
-            "RGBA",
-            (grid_cols * W_scaled, grid_rows * H_scaled),
-            color=(0, 0, 0, 255),
-        )
-        draw_canvas = ImageDraw.Draw(canvas)
-
-        for idx in range(position):
-            row, col = divmod(idx, grid_cols)
-
-            image_slice = (
-                    (image[:, :, idx, t] - img_min)
-                    / (img_max - img_min + 1e-9)
-                    * 255
-            ).astype(np.uint8)
-
-            img_rgb = np.stack([image_slice] * 3, axis=-1)
-            img_pil = Image.fromarray(img_rgb, mode="RGB").convert("RGBA")
-            img_pil = img_pil.resize((W_scaled, H_scaled), Image.NEAREST)
-
-            overlay = np.zeros((H, W, 4), dtype=np.uint8)
-            if t in mask_frames:
-                for ch in channels:
-                    ch_mask = mask[:, :, idx, t, ch]
-                    if np.any(ch_mask):
-                        overlay[ch_mask > 0] = OVERLAY_COLORS[ch]
-
-            overlay_pil = Image.fromarray(overlay, "RGBA").resize(
-                (W_scaled, H_scaled), Image.NEAREST
-            )
-            img_pil.alpha_composite(overlay_pil)
-
-            draw_tile = ImageDraw.Draw(img_pil)
-            draw_tile.rectangle(
-                [0, 0, int(28 * scale), int(22 * scale)],
-                fill=(211, 211, 211, 255),
-            )
-            draw_tile.text(
-                (3 * scale, 2 * scale),
-                f"{idx}",
-                fill=(0, 0, 0, 255),
-                font=font,
-            )
-
-            canvas.paste(
-                img_pil,
-                (col * W_scaled, row * H_scaled),
-                img_pil,
-            )
-
-        draw_canvas.rectangle(
-            [
-                canvas.width - int(60 * scale),
-                canvas.height - int(20 * scale),
-                canvas.width,
-                canvas.height,
-            ],
-            fill=(211, 211, 211, 255),
-        )
-        draw_canvas.text(
-            (canvas.width - int(55 * scale), canvas.height - int(20 * scale)),
-            f"{t:02}/{timesteps - 1:02}",
-            fill=(0, 0, 0, 255),
-            font=font,
-        )
-
-        frames[t] = canvas.convert("RGB")
-
-    if timesteps < 5:
-        fps = timesteps / 2
-    else:
-        fps = np.clip(timesteps / 2, 8, 15)
-    imageio.mimsave(output_gif, frames, fps=fps, loop=0)
 
 
 def find_crop_box(mask, crop_factor):
@@ -600,6 +513,7 @@ def find_crop_box(mask, crop_factor):
     list
         A list containing the coordinates of the bounding box [x_min, y_min, x_max, y_max]. These co-ordinates can be used to crop each slice of the input multislice image.
     '''
+    # Check shape of the input is 2D
     # Check shape of the input is 2D
     if len(mask.shape) != 2:
         raise ValueError("Input mask must be a 2D array")
@@ -678,6 +592,8 @@ def plot_volume_mass_curve(
         sys_idx,
         save_path,
 ):
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(2, 1, figsize=(8, 5.25), sharex=True)
 
     frames_raw = np.arange(len(raw_volume))
@@ -750,6 +666,8 @@ def plot_volume_curve(
         sys_idx,
         save_path,
 ):
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(1, 1, figsize=(8, 4))
 
     frames_raw = np.arange(len(raw_volume))
@@ -790,15 +708,6 @@ def plot_volume_curve(
     plt.close(fig)
 
 
-def confirm_selection(dia_idx, sys_idx):
-    """Store confirmed EDV/ESV indices in session state."""
-    st.session_state.edv_esv_selected.update({
-        "dia_idx": dia_idx,
-        "sys_idx": sys_idx,
-        "confirmed": True
-    })
-
-
 def wrap(key, min_val, max_val):
     if st.session_state[key] > max_val:
         st.session_state[key] = min_val
@@ -828,27 +737,54 @@ def frame_index_slider(
     return idx
 
 
+def confirm_selection(dia_idx, sys_idx):
+    """Store confirmed EDV|ESV indices in session state."""
+    st.session_state.edv_esv_selected.update({
+        "dia_idx": dia_idx,
+        "sys_idx": sys_idx,
+        "confirmed": True
+    })
+
+    save_config(st.session_state.edv_esv_selected, st.session_state['cache_config_path'])
+
+    make_video(
+        st.session_state.preprocessed["smooth_image"],
+        st.session_state.preprocessed["smooth_mask"],
+        save_file=full_edited_gif_path,
+        mask_frames=[dia_idx, sys_idx]
+    )
+    gif = Image.open(full_edited_gif_path)
+    frames = [f.copy() for f in ImageSequence.Iterator(gif)]
+    st.session_state['edited_frames'] = frames
+
+
 def edv_esv_view():
-    """Full EDV/ESV Finder view layout."""
+    """Full EDV|ESV Finder view layout."""
     if "edv_esv_selected" not in st.session_state:
         st.session_state.edv_esv_selected = {"dia_idx": None, "sys_idx": None, "confirmed": False}
 
     frames = st.session_state.preprocessed['edv_esv_frames']
-    raw_dia_idx = st.session_state.raw['raw_dia_idx']
-    raw_sys_idx = st.session_state.raw['raw_sys_idx']
+
+    if st.session_state.edv_esv_selected['confirmed']:
+        display_dia_idx = st.session_state.edv_esv_selected['dia_idx']
+        display_sys_idx = st.session_state.edv_esv_selected['sys_idx']
+
+    else:
+        display_dia_idx = st.session_state.raw['raw_dia_idx']
+        display_sys_idx = st.session_state.raw['raw_sys_idx']
     H, W, D, T, N = [st.session_state.preprocessed[k] for k in ["H", "W", "D", "T", "N"]]
 
     disabled_flag = st.session_state.edv_esv_selected["confirmed"]
 
-    _, col_center, _ = st.columns([0.2, 0.6, 0.2])
+    _, col_center, _ = st.columns([0.05, 0.9, 0.05])
     with col_center:
         col_edv, _, col_esv = st.columns([0.45, 0.1, 0.45])
 
         with col_edv:
-            dia_idx = frame_index_slider(T, frames, raw_dia_idx, 'EDV Index', disabled_flag, key='edv')
+            dia_idx = frame_index_slider(T, frames, display_dia_idx, 'EDV Index', disabled_flag, key='edv')
 
         with col_esv:
-            sys_idx = frame_index_slider(T, frames, raw_sys_idx, 'ESV Index', disabled_flag, key='esv')
+            sys_idx = frame_index_slider(T, frames, display_sys_idx, 'ESV Index', disabled_flag, key='esv')
 
         st.write('')
         if not disabled_flag:
@@ -860,22 +796,6 @@ def edv_esv_view():
             )
         else:
             st.success("EDV | ESV Confirmed!")
-
-    # Generate video if confirmed
-    if st.session_state.edv_esv_selected["confirmed"]:
-        dia_idx = st.session_state.edv_esv_selected["dia_idx"]
-        sys_idx = st.session_state.edv_esv_selected["sys_idx"]
-        remake_gif_frames(
-            blank_gif_path,
-            full_edited_gif_path,
-            st.session_state.preprocessed["smooth_image"],
-            st.session_state.preprocessed["smooth_mask"],
-            redo_frames=[dia_idx, sys_idx]
-        )
-
-        gif = Image.open(full_edited_gif_path)
-        frames = [f.copy() for f in ImageSequence.Iterator(gif)]
-        st.session_state['edited_frames'] = frames
 
 
 def slice_navigation(D):
@@ -942,13 +862,15 @@ def select_brush(N):
                       options=["Paint ✏️", "Erase ✂️"],
                       index=["Paint ✏️", "Erase ✂️"].index(st.session_state.brush_mode),
                       horizontal=True)
+
     st.session_state['brush_mode'] = action
     stroke_width_map = {"thin": 6, "medium": 20, "thick": 40}
 
-    stroke_width_sel = st.radio("Stroke width",
+    stroke_width_sel = st.radio("Stroke Width",
                                 options=list(stroke_width_map.keys()),
                                 index=list(stroke_width_map.keys()).index(st.session_state["stroke_width"]),
                                 horizontal=True)
+
     st.session_state['stroke_width'] = stroke_width_sel
 
     if action == "Paint ✏️":
@@ -965,6 +887,11 @@ def select_brush(N):
         channel = 0
     stroke_width = stroke_width_map[stroke_width_sel]
     return channel, action, stroke_width
+
+
+def normalize(image):
+    image = (image - np.min(image)) / (np.max(image) - np.min(image))
+    return image
 
 
 def mask_editor_view():
@@ -996,7 +923,7 @@ def mask_editor_view():
 
     with col2:
         edit_mode = st.radio('Segmentation Editor', ['Editor', 'Viewer'], index=0, horizontal=True)
-        stroke_color = f"rgba{OVERLAY_COLORS[background_idx][:3] + (0.8,)}" if action == "Erase ✂️" else f"rgba{OVERLAY_COLORS[channel][:3] + (0.4,)}"
+        stroke_color = f"rgba{OVERLAY_COLORS[background_idx][:3] + (0.8,)}" if action == "Erase ✂️" else f"rgba{OVERLAY_COLORS[channel][:3] + (0.65,)}"
 
         if edit_mode == 'Viewer':
             st.image(image_slice, width=DISPLAY_W)
@@ -1020,7 +947,7 @@ def mask_editor_view():
                 stroke_color=stroke_color,
                 background_image=get_overlay(image_slice, mask_slice, H, W, N, OVERLAY_COLORS),
                 update_streamlit=True,
-                height=DISPLAY_H,
+                height=H * DISPLAY_W / W,
                 width=DISPLAY_W,
                 drawing_mode='freedraw',
                 key=st.session_state['canvas']['canvas_key']
@@ -1073,37 +1000,42 @@ def mask_editor_view():
                         edited_mask[:, :, d, idx, ch][resized_mask > 0] = 1
 
                     st.session_state['edit_made'] = True
-                    st.rerun()
-                else:
+                    save_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
                     st.rerun()
 
             with col_clear:
                 if st.button('Clear Slice', use_container_width=True):
                     edited_mask[:, :, d, idx, :] = 0
+                    save_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
+
                     st.session_state['edit_made'] = True
                     st.rerun()
 
+    # ---------- right column preview ----------
     with col3:
-        view_mode = st.radio('Corrected Mask', ['Static', 'GIF', 'Viewer'],
-                             index=['Static', 'GIF', 'Viewer'].index(st.session_state["view_mode"]),
-                             horizontal=True)
-        st.session_state["view_mode"] = view_mode
+        view_mode = st.radio(
+            "Corrected Mask",
+            ["Static", "Viewer"],
+            index=0,
+            horizontal=True,
+        )
 
-        if st.session_state.get('edited_frames') is None or st.session_state["edit_made"]:
-            remake_gif_frames(
-                full_edited_gif_path,
-                full_edited_gif_path,
+        if st.session_state.get("edited_frames") is None or st.session_state["edit_made"]:
+            make_video(
                 image,
                 edited_mask,
-                redo_frames=[dia_idx, sys_idx]
+                save_file=full_edited_gif_path,
+                mask_frames=[dia_idx, sys_idx],
             )
             gif = Image.open(full_edited_gif_path)
-            st.session_state['edited_frames'] = [f.copy() for f in ImageSequence.Iterator(gif)]
-            st.session_state['edit_made'] = False
+            st.session_state["edited_frames"] = [f.copy() for f in ImageSequence.Iterator(gif)]
+            st.session_state["edit_made"] = False
 
-        if st.session_state["view_mode"] == "Static":
-            st.image(st.session_state['edited_frames'][idx])
-        elif st.session_state["view_mode"] == "GIF":
-            st.image(full_edited_gif_path)
-        else:
-            st.image(image_slice, width=DISPLAY_W)
+        if view_mode == "Static":
+            view_image = st.session_state["edited_frames"][0 if idx_label == "End-Diastole" else 1]
+            width = int(DISPLAY_W * 1.5)
+        elif view_mode == "Viewer":
+            view_image = image_slice
+            width = int(DISPLAY_W)
+
+        st.image(view_image, width=width)
