@@ -18,6 +18,7 @@ from matplotlib.colors import ListedColormap
 import streamlit as st
 from streamlit_drawable_canvas import st_canvas
 
+
 from skimage.measure import label as cc_label, regionprops
 from scipy.ndimage import (
     binary_fill_holes,
@@ -39,6 +40,7 @@ edv_esv_gif_path = f'results/temp/edv_esv.gif'
 edited_gif_path = f'results/temp/edited_edv_esv.gif'
 raw_curve_path = f'results/temp/raw_metrics.png'
 edited_curve_path = f'results/temp/edited_metrics.png'
+review_list_path = 'results/review.csv'
 cache_dir = 'cache'
 
 os.makedirs('results/temp', exist_ok=True)
@@ -49,7 +51,7 @@ os.makedirs(cache_dir, exist_ok=True)
 
 GIF_W = 150
 DISPLAY_W = 400
-BACKGROUND_COLOR = (100, 100, 0, 0)
+BACKGROUND_COLOR = (150, 150, 150, 0)
 LV_MYO_COLOR = (0, 255, 255, 50) # Blue
 LV_COLOR = (255, 10, 10, 50)      # Red
 
@@ -72,33 +74,58 @@ OVERLAY_COLORS = {
 }
 
 
-def save_config(config: dict, path) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as f:
-        json.dump(config, f, indent=2)
+def cleanup_case_artifacts(study_uid, local_dir=None):
+    # Cache files
+    for f in [
+        f"{cache_dir}/config___{study_uid}.json",
+        f"{cache_dir}/masks___{study_uid}.nii.gz",
+    ]:
+        try:
+            os.remove(f)
+        except FileNotFoundError:
+            pass
+
+    # # Temp artifacts
+    # try:
+    #     for p in Path("results/temp").glob("*"):
+    #         p.unlink()
+    # except Exception:
+    #     pass
+
+    result_end_pts = ['edited_sax_df', 'gifs', 'masks', 'temp']
+    for rep in result_end_pts:
+        result_path_oi = Path(f"results/{rep}")
+
+        if result_path_oi.exists():
+            for item in result_path_oi.iterdir():
+                if item.is_file():
+                    item.unlink()
+                elif item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+
+    # Downloaded case directory
+    if local_dir:
+        shutil.rmtree(local_dir, ignore_errors=True)
+
+    # Streamlit caches
+    try:
+        st.cache_data.clear()
+        st.cache_resource.clear()
+    except Exception:
+        pass
 
 
-def load_config(path) -> dict:
-    path = Path(path)
-    with path.open("r") as f:
-        return json.load(f)
-
-
-def save_mask(mask, save_path):
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    nib_mask = nib.Nifti1Image(mask, affine=np.eye(4), dtype='uint8')
-    nib.save(nib_mask, save_path)
-
-
-def skip_case(study_uid, patient, study_date):
+def skip_case(study_uid, patient, study_date, skip_type='skip'):
     """UI handler for skipping a case."""
-    from aws_utils import skip_case_ddb, fetch_staged_roundel_cases
+    from aws_utils import skip_case_ddb, circle_case_ddb, fetch_staged_roundel_cases
 
     # Update DynamoDB
-    skip_case_ddb(study_uid)
-
-    st.warning(f"⏭️ Skipped case for {patient} ({study_date})")
+    if skip_type == 'skip':
+        skip_case_ddb(study_uid)
+        st.warning(f"⏭️ Skipped case for {patient} ({study_date})")
+    elif skip_type == 'circle':
+        circle_case_ddb(study_uid)
+        st.warning(f"⏭️ Marked case for circle {patient} ({study_date})")
 
     # Refresh staged list
     new_cases = fetch_staged_roundel_cases()
@@ -128,14 +155,111 @@ def skip_case(study_uid, patient, study_date):
     st.rerun()
 
 
-def load_font(size):
-    """
-    try:
-        font = load_font(int(18 * scale))
-    except:
-        font = ImageFont.load_default()
-    """
+def get_sax_series_uid_list(data_path):
+    data_path = Path(data_path)
 
+    # All image UIDs in data directory
+    sax_series_uid_list = sorted(
+        p.stem.replace("image___", "").replace(".nii", "")
+        for p in data_path.glob("*")
+        if "image" in p.name
+    )
+
+    # Already-saved UIDs
+    saved_sax_series_uid_list = [
+        p.stem
+        for p in Path("results/edited_sax_df").glob("*.csv")
+    ]
+
+    # Remove completed cases
+    sax_series_uid_list = sorted(
+        set(sax_series_uid_list) - set(saved_sax_series_uid_list)
+    )
+
+    # print(sax_series_uid_list)
+    return sax_series_uid_list
+
+
+
+def save_config(config: dict, path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        json.dump(config, f, indent=2)
+
+
+def load_config(path) -> dict:
+    path = Path(path)
+    with path.open("r") as f:
+        return json.load(f)
+
+
+def save_cached_mask(mask, save_path):
+    np.save(save_path, mask)
+
+
+def load_cached_mask(save_path):
+    return np.load(save_path)
+
+
+def save_mask(mask, save_path):
+    nib_mask = nib.Nifti1Image(mask, affine=np.eye(4), dtype='uint8')
+    nib.save(nib_mask, save_path)
+
+
+def download_review_csv(review_list_path):
+    available_cases = get_sax_series_uid_list(st.session_state[
+                                                  'data_path'])  # needs to be the list of sax_series_uid left in the
+                                                                 # list, so the list doesn't have ones that Nickie has already completed
+
+    if os.path.exists(review_list_path):
+        df = pd.read_csv(review_list_path)
+        df = df[df["sax_series_uid"].isin(available_cases)]
+    else:
+        df = pd.DataFrame(columns=["patient", "study_date", "sax_series_uid"])
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(label="Download Review List", data=csv_bytes, file_name=os.path.basename(review_list_path),
+                       mime="text/csv", use_container_width=True, icon=":material/download:")
+
+
+def read_or_create_review_csv(review_list_path, patient, study_date, sax_series_uid):
+
+    # df = pd.DataFrame(columns=["patient", "study_date", "sax_series_uid"])
+    # df.to_csv(review_list_path, index=False)
+
+    if st.button('Mark for Review 📋', type='primary', use_container_width=True):
+        available_cases = get_sax_series_uid_list(st.session_state["data_path"])
+        added_to_list = sax_series_uid in available_cases
+
+        if os.path.exists(review_list_path):
+            df = pd.read_csv(review_list_path)
+            df = df[df["sax_series_uid"].isin(available_cases)]
+
+            if added_to_list and sax_series_uid not in df["sax_series_uid"].values:
+                new_row = {
+                    "patient": patient,
+                    "study_date": study_date,
+                    "sax_series_uid": sax_series_uid,
+                }
+                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        else:
+            if added_to_list:
+                df = pd.DataFrame(
+                    {
+                        "patient": [patient],
+                        "study_date": [study_date],
+                        "sax_series_uid": [sax_series_uid],
+                    }
+                )
+            else:
+                df = pd.DataFrame(columns=["patient", "study_date", "sax_series_uid"])
+
+        df.to_csv(review_list_path, index=False)
+        st.rerun()
+
+
+def load_font(size):
     # Try Linux font
     try:
         return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
@@ -153,11 +277,13 @@ def load_font(size):
 # --------------------------------------------------------------
 # Initialization
 # --------------------------------------------------------------
-def initialize_app(data_path, study_uid, pixelspacing, thickness, preprocess=True):
+def initialize_app(data_path, patient, study_date, study_uid, pixelspacing, thickness, preprocess=True):
     st.session_state['data_path'] = data_path
-    st.session_state['study_uid'] = study_uid
+    st.session_state['sax_series_uid'] = study_uid
+    st.session_state['patient'] = patient
+    st.session_state['study_date'] = study_date
 
-    os.makedirs(f'{data_path}/cache', exist_ok=True)
+    # os.makedirs(f'{data_path}/cache', exist_ok=True)
 
     # Store the last selected UID in session_state
     if "last_sax_uid" not in st.session_state:
@@ -232,8 +358,8 @@ def initialize_app(data_path, study_uid, pixelspacing, thickness, preprocess=Tru
     x_min, y_min, x_max, y_max = find_crop_box(np.max(raw_mask[..., [lv_idx, lv_myo_idx]], axis=(-1, -2, -3)),
                                                crop_factor=1.5)
 
-    subpixel_resolution = 500 // (y_max - y_min)
-    subpixel_resolution = min(4, subpixel_resolution)
+    subpixel_resolution = DISPLAY_W // (y_max - y_min)
+    subpixel_resolution = min(6, subpixel_resolution)
     st.session_state['subpixel_resolution'] = subpixel_resolution
 
     preprocessed_image = raw_image[y_min:y_max, x_min:x_max, :, :]
@@ -245,19 +371,18 @@ def initialize_app(data_path, study_uid, pixelspacing, thickness, preprocess=Tru
 
     zoom = [st.session_state['subpixel_resolution'], st.session_state['subpixel_resolution'], 1, 1]
 
-    smoothed_image = cv_zoom(preprocessed_image, zoom=zoom)
+    smoothed_image = cv_zoom(preprocessed_image, zoom=zoom, interpolation=cv2.INTER_LINEAR)
 
     st.session_state['cache_config_path'] = f"{cache_dir}/config___{study_uid}.json"
-    st.session_state['cache_mask_path'] = f"{cache_dir}/masks___{study_uid}.nii.gz"
+    st.session_state['cache_mask_path'] = f"{cache_dir}/masks___{study_uid}.npy"
 
     if os.path.exists(st.session_state['cache_config_path']) and os.path.exists(st.session_state['cache_mask_path']):
-        smoothed_mask = load_nii(st.session_state['cache_mask_path']).astype("uint8")
+        smoothed_mask = load_cached_mask(st.session_state['cache_mask_path']).astype("uint8")
         cached = True
     else:
-        smoothed_mask = cv_zoom_mask(
+        smoothed_mask = cv_zoom_smooth(
             preprocessed_mask,
-            zoom=zoom + [1],
-            interpolation=cv2.INTER_NEAREST,
+            zoom=zoom + [1]
         )
         cached = False
 
@@ -289,7 +414,7 @@ def initialize_app(data_path, study_uid, pixelspacing, thickness, preprocess=Tru
     # Initialize edited mask
     # -----------------------------
     st.session_state['edited_mask'] = st.session_state.preprocessed["smooth_mask"].copy()
-    save_mask(st.session_state['edited_mask'], save_path=st.session_state['cache_mask_path'])
+    save_cached_mask(st.session_state['edited_mask'], save_path=st.session_state['cache_mask_path'])
     st.session_state['mask_hash'] = mask_hash(st.session_state.preprocessed["mask"])
     st.session_state["brush_mode"] = "Paint ✏️"
     st.session_state["stroke_width"] = "thin"
@@ -300,11 +425,11 @@ def initialize_app(data_path, study_uid, pixelspacing, thickness, preprocess=Tru
     st.session_state.initialized_all = True
 
 
-def cv_zoom(images, zoom, interpolation=cv2.INTER_CUBIC):
+def cv_zoom(images, zoom, interpolation):
     """
     Resize height and width of a 4D or 5D array using OpenCV. Only H and W are scaled.
 
-    Args:
+    Args
         images (numpy.ndarray): Array of shape (H, W, D, T) or (H, W, D, T, C)
         zoom_factors (list or tuple): Zoom factors for (H, W, D, T, C). Only H and W > 1
         interpolation (int): OpenCV interpolation method (default: cv2.INTER_CUBIC)
@@ -335,18 +460,17 @@ def cv_zoom(images, zoom, interpolation=cv2.INTER_CUBIC):
     return resized
 
 
-def cv_zoom_mask(
+def cv_zoom_smooth(
         mask,
         zoom,
-        sigma=2.0,
-        interpolation=cv2.INTER_CUBIC,
+        sigma=2.0
 ):
     """
     mask: H,W,D,T,C
     returns: H,W,D,T,C one-hot
     """
 
-    zoomed = cv_zoom(mask.astype(np.float32), zoom, interpolation=interpolation)
+    zoomed = cv_zoom(mask.astype(np.float32), zoom, interpolation=cv2.INTER_LINEAR)
 
     myo = (zoomed[..., lv_myo_idx] > 0.5).astype(np.float32)
     endo = (zoomed[..., lv_idx] > 0.5).astype(np.float32)
@@ -408,15 +532,8 @@ def thicken_close_fill_and_smooth(strokes, stroke_width):
         closed = binary_dilation(strokes, iterations=dilation_factor)
         filled = binary_fill_holes(closed)
         filled = binary_erosion(filled, iterations=dilation_factor)
-
-        # Apply minor Gaussian blur and re-threshold to smooth edges
-        # blurred = gaussian_filter(filled.astype(float), sigma=0.5)
-        # smoothed = blurred > 0.48  # Convert back to binary
         return filled.astype('uint8')
     else:
-        # For strokes without rings, apply very mild smoothing
-        # blurred = gaussian_filter(strokes.astype(float), sigma=0.5)
-        # smoothed = blurred > 0.48
         return strokes.astype('uint8')
 
 
@@ -513,7 +630,6 @@ def find_crop_box(mask, crop_factor):
     list
         A list containing the coordinates of the bounding box [x_min, y_min, x_max, y_max]. These co-ordinates can be used to crop each slice of the input multislice image.
     '''
-    # Check shape of the input is 2D
     # Check shape of the input is 2D
     if len(mask.shape) != 2:
         raise ValueError("Input mask must be a 2D array")
@@ -864,7 +980,7 @@ def select_brush(N):
                       horizontal=True)
 
     st.session_state['brush_mode'] = action
-    stroke_width_map = {"thin": 6, "medium": 20, "thick": 40}
+    stroke_width_map = {"thin": 4, "medium": 15, "thick": 40}
 
     stroke_width_sel = st.radio("Stroke Width",
                                 options=list(stroke_width_map.keys()),
@@ -960,7 +1076,7 @@ def mask_editor_view():
             st.session_state['canvas']['previous_objects'] = current_objects
 
             # Save / clear buttons (trigger rerun only here)
-            col_save, col_clear = st.columns([1, 0.3])
+            col_save, col_clear = st.columns([1, 0.15])
             with col_save:
                 save_contour = st.button('Save Contour', type='primary', use_container_width=True)
                 if save_contour and canvas_result and canvas_result.image_data is not None and current_objects:
@@ -1000,14 +1116,13 @@ def mask_editor_view():
                         edited_mask[:, :, d, idx, ch][resized_mask > 0] = 1
 
                     st.session_state['edit_made'] = True
-                    save_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
+                    save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
                     st.rerun()
 
             with col_clear:
-                if st.button('Clear Slice', use_container_width=True):
+                if st.button('❌', use_container_width=True):
                     edited_mask[:, :, d, idx, :] = 0
-                    save_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
-
+                    save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
                     st.session_state['edit_made'] = True
                     st.rerun()
 
@@ -1039,3 +1154,17 @@ def mask_editor_view():
             width = int(DISPLAY_W)
 
         st.image(view_image, width=width)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            download_review_csv(review_list_path)
+
+        with col2:
+            read_or_create_review_csv(review_list_path, patient=st.session_state['patient'],
+                                      study_date=st.session_state['study_date'],
+                                      sax_series_uid=st.session_state['sax_series_uid'])
+            df = pd.read_csv(review_list_path)
+            if st.session_state['sax_series_uid'] in df["sax_series_uid"].values:
+                st.warning(f"{st.session_state['patient']} | {st.session_state['study_date']} in Review")
+
+

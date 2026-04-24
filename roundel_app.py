@@ -51,6 +51,7 @@ gif_url = case_item.get('gif_url')
 pipeline_edv = case_item.get('edv', '')
 pipeline_esv = case_item.get('esv', '')
 pipeline_mass = case_item.get('mass', '')
+model_ind = case_item.get('model_ind', '2D')
 
 if not gif_url.startswith("http"):
     gif_url = f"https://{gif_url}"
@@ -66,17 +67,19 @@ thickness    = float(case_item["thickness"])
 # --------------------------------------------------------------
 # Download artifacts from S3
 # --------------------------------------------------------------
-local_dir = download_sax_artifacts(study_uid, saxdf_bool=False)
+local_dir = download_sax_artifacts(study_uid, saxdf_bool=False, model_ind=model_ind)
+
+sax_series_uid_list = get_sax_series_uid_list(local_dir)
 
 # Initialize Roundel logic
-initialize_app(local_dir, study_uid, pixelspacing, thickness,  preprocess=True)
+initialize_app(local_dir, patient, study_date, study_uid, pixelspacing, thickness,  preprocess=True)
 # --------------------------------------------------------------
 # Display sidebar metadata
 # --------------------------------------------------------------
 with col2:
     # Display metadata in the app
     st.markdown(f"**🟢 {len(cases)} total staged cases**")
-    st.markdown(f"**Study UID:** {study_uid} | **FID:** {patient} | **Study Date:** {study_date}")
+    st.markdown(f"**Study UID:** {study_uid} | **FID:** {patient} | **Study Date:** {study_date} | **2D or 4D:** {model_ind}")
     st.markdown(f"**Flags from SageMaker:** {sagemaker_flags}")
     st.markdown(f"**SageMaker Comments:** {comments}")
     st.markdown(f"**Description:** {description} | **Pixel Size**: {pixelspacing} x {pixelspacing}mm | **Slice Thickness**: {thickness} mm")
@@ -86,20 +89,30 @@ with col2:
 
     # --- Skip Case Button ---
     if st.button("⏭️ Skip Case (Artifacts Too Heavy)", type="secondary", use_container_width=True):
-        skip_case(study_uid, patient, study_date)
+        skip_case(study_uid, patient, study_date, skip_type='skip')
+        cleanup_case_artifacts(
+            study_uid=study_uid,
+            local_dir=local_dir
+        )
+
+    # --- Push to Circle Case Button ---
+    if st.button("⏭️ Needs Circle (Task Too Complex)", type="secondary", use_container_width=True):
+        skip_case(study_uid, patient, study_date, skip_type='circle')
+        cleanup_case_artifacts(
+            study_uid=study_uid,
+            local_dir=local_dir
+        )
 
 # --------------------------------------------------------------
 # App
 # --------------------------------------------------------------
 
-view = st.radio(
-    "",
-    ["EDV/ESV Finder 🔍", "Mask Editor 📝", "Final Result ✅"],
-    index=0,
-    horizontal=True,
-    label_visibility="collapsed",
+view = st.segmented_control(
+    "Tab",
+    options=["EDV/ESV Finder 🔍", "Mask Editor 📝", "Final Result ✅"],
+    default = "EDV/ESV Finder 🔍",
+    label_visibility='hidden'
 )
-
 st.divider()
 
 # --------------------------------------------------------------
@@ -145,8 +158,10 @@ if view == "Final Result ✅":
         st.error("Select and confirm EDV/ESV first.")
         st.stop()
 
-    edited_mask = cv_zoom(edited_mask, zoom=[1 / st.session_state['subpixel_resolution'],
-                                             1 / st.session_state['subpixel_resolution'], 1, 1])
+    edited_mask = cv_zoom(edited_mask,
+                          zoom=[1 / st.session_state['subpixel_resolution'],
+                                1 / st.session_state['subpixel_resolution'], 1, 1],
+                          interpolation=cv2.INTER_NEAREST)
 
     final_gif_path = f'results/gifs/{study_uid}.gif'
     # Compute metrics
@@ -206,6 +221,12 @@ if view == "Final Result ✅":
                 patient=patient,
                 study_date=study_date,
                 description=description,
+                model_ind=model_ind
+            )
+
+            cleanup_case_artifacts(
+                study_uid=study_uid,
+                local_dir=local_dir
             )
 
             st.success(f"Saved results for {patient} ({study_date})")
@@ -225,8 +246,10 @@ if view == "Final Result ✅":
             # ----------------------------------------------------------
             reset_keys = [
                 "edited_mask", "edv_esv_selected", "preprocessed", "raw",
+                "edited_frames", "mask_hash", "cache_config_path", "cache_mask_path",
                 "point1", "point2", "coord1", "coord2", "crop1", "crop2"
             ]
+
             for k in reset_keys:
                 st.session_state.pop(k, None)
 
