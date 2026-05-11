@@ -1126,6 +1126,79 @@ def mask_editor_view():
                     st.session_state['edit_made'] = True
                     st.rerun()
 
+            st.divider()
+            st.caption('Dilation and Erosion')
+            col_expand, col_shrink, _, col_expand_myo, col_shrink_myo = st.columns([1, 1, 1, 1, 1])
+
+            with col_expand:
+                if st.button("🔴" + " :material/north:", use_container_width=True, key="dilate_bp"):
+                    # Step 1: dilate last channel
+                    lv_channel = st.session_state['edited_mask'][:, :, d, idx, lv_idx]
+                    dilated_last = binary_dilation(lv_channel)
+                    edited_mask[:, :, d, idx, lv_myo_idx] = edited_mask[:, :, d, idx, lv_myo_idx] & (~dilated_last)
+                    # Step 3: assign updated last channel
+                    edited_mask[:, :, d, idx, -1] = dilated_last
+                    st.session_state['edit_made'] = True
+                    save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
+                    st.rerun()
+
+            with col_shrink:
+                if st.button("🔴" + " :material/south:", use_container_width=True, key="erode_bp"):
+                    lv_channel = st.session_state['edited_mask'][:, :, d, idx, lv_idx]
+                    eroded_lv = binary_erosion(lv_channel, iterations=1)
+
+                    # ring = original LV minus eroded LV
+                    lv_ring = lv_channel & (~eroded_lv)
+
+                    # add only the ring to myocardium
+                    edited_mask[:, :, d, idx, lv_myo_idx] = (
+                            edited_mask[:, :, d, idx, lv_myo_idx] | lv_ring
+                    )
+
+                    # UPDATE: assign the eroded LV back to the LV channel
+                    edited_mask[:, :, d, idx, lv_idx] = eroded_lv
+
+                    st.session_state['edit_made'] = True
+                    save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
+                    st.rerun()
+
+            with col_expand_myo:
+                if st.button("🔵" + " :material/north:", use_container_width=True, key="dilate_myo"):
+                    # Get epicardium = LV blood pool + myocardium
+                    lv_channel = st.session_state['edited_mask'][:, :, d, idx, lv_idx]
+                    myo_channel = st.session_state['edited_mask'][:, :, d, idx, lv_myo_idx]
+                    epicardium = lv_channel | myo_channel
+
+                    # Dilate epicardium outward
+                    dilated_epi = binary_dilation(epicardium, iterations=1)
+
+                    # New outer ring = dilated epicardium minus original epicardium
+                    outer_ring = dilated_epi & (~epicardium)
+
+                    # Add outer ring to myocardium
+                    edited_mask[:, :, d, idx, lv_myo_idx] = myo_channel | outer_ring
+
+                    st.session_state['edit_made'] = True
+                    save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
+                    st.rerun()
+
+            with col_shrink_myo:
+                if st.button("🔵" + " :material/south:", use_container_width=True, key="erode_myo"):
+                    # Get epicardium = LV blood pool + myocardium
+                    lv_channel = st.session_state['edited_mask'][:, :, d, idx, lv_idx]
+                    myo_channel = st.session_state['edited_mask'][:, :, d, idx, lv_myo_idx]
+                    epicardium = lv_channel | myo_channel
+
+                    # Erode epicardium inward
+                    eroded_epi = binary_erosion(epicardium, iterations=1)
+
+                    # New myocardium = eroded epicardium minus LV blood pool
+                    edited_mask[:, :, d, idx, lv_myo_idx] = eroded_epi & (~lv_channel)
+
+                    st.session_state['edit_made'] = True
+                    save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
+                    st.rerun()
+
     # ---------- right column preview ----------
     with col3:
         view_mode = st.radio(
@@ -1157,14 +1230,16 @@ def mask_editor_view():
 
         col1, col2 = st.columns(2)
         with col1:
-            download_review_csv(review_list_path)
+            if os.path.exists(review_list_path):
+                download_review_csv(review_list_path)
 
         with col2:
             read_or_create_review_csv(review_list_path, patient=st.session_state['patient'],
                                       study_date=st.session_state['study_date'],
                                       sax_series_uid=st.session_state['sax_series_uid'])
-            df = pd.read_csv(review_list_path)
-            if st.session_state['sax_series_uid'] in df["sax_series_uid"].values:
-                st.warning(f"{st.session_state['patient']} | {st.session_state['study_date']} in Review")
+            if os.path.exists(review_list_path):
+                df = pd.read_csv(review_list_path)
+                if st.session_state['sax_series_uid'] in df["sax_series_uid"].values:
+                    st.warning(f"{st.session_state['patient']} | {st.session_state['study_date']} in Review")
 
 
