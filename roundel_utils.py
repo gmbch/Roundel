@@ -51,7 +51,7 @@ os.makedirs('results/edited_sax_df', exist_ok=True)
 os.makedirs(cache_dir, exist_ok=True)
 
 GIF_W = 150
-DISPLAY_W = 400
+DISPLAY_H = DISPLAY_W = 400
 BACKGROUND_COLOR = (150, 150, 150, 0)
 LV_MYO_COLOR = (0, 255, 255, 50) # Blue
 LV_COLOR = (255, 10, 10, 50)      # Red
@@ -1067,41 +1067,40 @@ def normalize(image):
 
 # recreate image not canvas
 def mask_editor_view():
-    """Full Mask Editor layout."""
-    if not st.session_state['edv_esv_selected']["confirmed"]:
+    """Efficient Mask Editor with controlled reruns and canvas caching."""
+    if not st.session_state.edv_esv_selected["confirmed"]:
         st.error("Select and confirm EDV/ESV first.")
         st.stop()
 
-    col1, col2, col3 = st.columns([1, 1.5, 1.5])
-
     H, W, D, T, N = [st.session_state.preprocessed[k] for k in ["H", "W", "D", "T", "N"]]
     image = st.session_state.preprocessed["smooth_image"]
+    edited_mask = st.session_state['edited_mask']
+    dia_idx = st.session_state.edv_esv_selected["dia_idx"]
+    sys_idx = st.session_state.edv_esv_selected["sys_idx"]
+
+    col1, col2, col3 = st.columns([1, 1.5, 1.5])
 
     with col1:
-        ventricle_label = st.radio("Ventricle", options=["Left Ventricle", "Right Ventricle"], index=0, horizontal=True)
-        ventricle = 'lv' if 'left' in ventricle_label.lower() else 'rv'
-        channel, action, stroke_width = select_brush(N, ventricle)
-
-        st.caption('Image Selection')
-        idx_label = st.radio("Frame", options=["End-Diastole", "End-Systole"], index=0, horizontal=True)
-        d = slice_navigation(D)
-
-        edited_mask = st.session_state[f'edited_mask_{ventricle}']
-        dia_idx = st.session_state.edv_esv_selected[f"{ventricle}_dia_idx"]
-        sys_idx = st.session_state.edv_esv_selected[f"{ventricle}_sys_idx"]
+        channel, action, stroke_width = select_brush(N)
+        st.divider()
+        idx_label = st.radio("Frame", ["End-Diastole", "End-Systole"], index=0, horizontal=True)
+        d, reset_canvas = slice_navigation(D)
 
     idx = dia_idx if idx_label == "End-Diastole" else sys_idx
 
-    image_slice = ((image[:, :, d, idx] - image[:, :, d, idx].min()) / (
-                image[:, :, d, idx].max() - image[:, :, d, idx].min()) * 255).astype(np.uint8)
+    # Normalize slice once per display
+    img_slice = image[:, :, d, idx]
+    image_slice = ((img_slice - img_slice.min()) / (img_slice.max() - img_slice.min()) * 255).astype(np.uint8)
     mask_slice = edited_mask[:, :, d, idx, :]
 
     with col2:
         edit_mode = st.radio('Segmentation Editor', ['Editor', 'Viewer'], index=0, horizontal=True)
-        stroke_color = f"rgba{OVERLAY_COLORS[background_idx][:3] + (0.7,)}" if action == "Erase ✂️" else f"rgba{OVERLAY_COLORS[channel][:3] + (0.4,)}"
+        stroke_color = f"rgba{OVERLAY_COLORS[background_idx][:3] + (0.8,)}" if action == "Erase ✂️" else f"rgba{OVERLAY_COLORS[channel][:3] + (0.65,)}"
+
         if edit_mode == 'Viewer':
             st.image(image_slice, width=DISPLAY_W)
         else:
+            # Initialize canvas state
             if 'canvas' not in st.session_state:
                 st.session_state['canvas'] = {
                     'previous_d': d,
@@ -1109,140 +1108,198 @@ def mask_editor_view():
                     'previous_sig': None,
                 }
 
-            # STABLE key (no d): the canvas never remounts on slice change, which
-            # was the cause of the blank canvas. Strokes are cleared via
-            # initial_drawing (below) instead of by changing the key.
-            canvas_key = f'editor_{ventricle}'
-
-            # Clear strokes when the slice/frame changes WITHOUT remounting.
             sig = (d, idx)
             force_empty = st.session_state['canvas'].get('previous_sig') != sig
             st.session_state['canvas']['previous_sig'] = sig
 
-            _canvas_kwargs = dict(
+            canvas_kwargs = dict(
                 stroke_width=stroke_width,
                 stroke_color=stroke_color,
-                background_image=get_overlay(image_slice, mask_slice, H, W, N, OVERLAY_COLORS, ventricle),
+                background_image=get_overlay(image_slice, mask_slice, H, W, N, OVERLAY_COLORS),
                 update_streamlit=True,
                 height=DISPLAY_H,
                 width=DISPLAY_W,
                 drawing_mode='freedraw',
-                key=canvas_key,
+                key='editor',
             )
+
             if force_empty:
-                _canvas_kwargs['initial_drawing'] = {"version": "4.4.0", "objects": []}
+                canvas_kwargs["initial_drawing"] = {
+                    "version": "4.4.0",
+                    "objects": [],
+                }
 
-            canvas_result = st_canvas(**_canvas_kwargs)
+            canvas_result = st_canvas(**canvas_kwargs)
 
+            # Track current objects
             current_objects = []
-            if canvas_result is not None and canvas_result.json_data is not None:
+            if canvas_result and canvas_result.json_data:
                 current_objects = canvas_result.json_data.get("objects", [])
-
-            st.session_state['canvas']['previous_d'] = d
             st.session_state['canvas']['previous_objects'] = current_objects
 
-            col1, col2 = st.columns([1, 0.3])
-            edited_mask = st.session_state[f'edited_mask_{ventricle}']
-
-            with col1:
+            # Save / clear buttons (trigger rerun only here)
+            col_save, col_clear = st.columns([1, 0.15])
+            with col_save:
                 save_contour = st.button('Save Contour', type='primary', use_container_width=True)
-                if canvas_result and canvas_result.image_data is not None:
-                    objects = canvas_result.json_data.get("objects", [])
-                    if save_contour and objects:
-                        brush_data = np.array(canvas_result.image_data).astype(np.uint8)  # Hc x Wc x 4 (RGBA)
-                        if action == "Erase ✂️":
-                            mask_bin = np.any(brush_data[:, :, :3] != 0, axis=-1)
-                            mask_bin = thicken_close_fill_and_smooth(mask_bin, stroke_width)
-                            resized_mask = np.array(Image.fromarray(mask_bin).resize(
+                if save_contour and canvas_result and canvas_result.image_data is not None and current_objects:
+                    brush_data = np.array(canvas_result.image_data)
+                    rgb = brush_data[:, :, :3].astype(np.float32)
+                    alpha = brush_data[:, :, 3].astype(np.float32) / 255.0
+
+                    overlay_colors_list = np.array([color[:3] for color in OVERLAY_COLORS.values()], dtype=np.float32)
+                    overlay_channels = list(OVERLAY_COLORS.keys())
+
+                    h, w, _ = rgb.shape
+                    rgb_flat = rgb.reshape(-1, 3)
+                    alpha_flat = alpha.flatten()
+                    distances = np.linalg.norm(rgb_flat[:, None, :] - overlay_colors_list[None, :, :], axis=-1)
+                    closest_idx = np.argmin(distances, axis=1)
+
+                    mask_flat = np.zeros((h * w, len(overlay_channels)), dtype=np.uint8)
+                    for idx_color, ch in enumerate(overlay_channels):
+                        mask_flat[:, idx_color] = ((closest_idx == idx_color) & (alpha_flat > 0)).astype(np.uint8)
+
+                    masks = []
+                    for idx_color, ch in enumerate(overlay_channels):
+                        mask_bool = mask_flat[:, idx_color].reshape(h, w)
+                        mask_bool = thicken_close_fill_and_smooth(mask_bool, stroke_width)
+                        masks.append(mask_bool)
+
+                    combined_mask = np.stack(masks, axis=-1)
+                    for idx_color, ch in enumerate(overlay_channels):
+                        resized_mask = np.array(
+                            Image.fromarray(combined_mask[:, :, idx_color]).resize(
                                 (W * st.session_state['subpixel_resolution'],
-                                 H * st.session_state['subpixel_resolution']), resample=Image.NEAREST))
-                            edited_mask[:, :, d, idx, :][resized_mask > 0] = 0
+                                 H * st.session_state['subpixel_resolution']),
+                                resample=Image.NEAREST
+                            )
+                        )
+                        edited_mask[:, :, d, idx, :][resized_mask > 0] = 0
+                        edited_mask[:, :, d, idx, ch][resized_mask > 0] = 1
 
-                        else:
-                            rgb = brush_data[:, :, :3].astype(np.float32)
-                            alpha = brush_data[:, :, 3].astype(np.float32) / 255.0
+                    st.session_state['edit_made'] = True
+                    save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
+                    st.rerun()
 
-                            overlay_channels = list(BRUSH_LABELS.keys())
-                            overlay_colors_list = np.array([OVERLAY_COLORS[i][:3] for i in overlay_channels],
-                                                           dtype=np.float32)
-
-                            h, w, _ = rgb.shape
-                            rgb_flat = rgb.reshape(-1, 3)
-                            alpha_flat = alpha.flatten()
-
-                            # Map each pixel to closest overlay color
-                            distances = np.linalg.norm(rgb_flat[:, None, :] - overlay_colors_list[None, :, :], axis=-1)
-                            closest_idx = np.argmin(distances, axis=1)
-
-                            # Prepare masks at canvas resolution
-                            mask_flat = np.zeros((h * w, len(overlay_channels)), dtype=np.uint8)
-                            for idx_color, channel in enumerate(overlay_channels):
-                                mask_flat[:, idx_color] = ((closest_idx == idx_color) & (alpha_flat > 0)).astype(
-                                    np.uint8)
-
-                            # Reshape masks and apply stroke thickening
-                            masks = []
-                            for idx_color, channel in enumerate(overlay_channels):
-                                mask_bool = mask_flat[:, idx_color].reshape(h, w)
-                                mask_bool = thicken_close_fill_and_smooth(mask_bool, stroke_width)
-                                masks.append(mask_bool)
-
-                            # Combine all masks into a single array at canvas resolution
-                            combined_mask = np.stack(masks, axis=-1)  # Hc x Wc x num_channels
-
-                            # Resize all masks once at the end to target size
-                            for idx_color, channel in enumerate(overlay_channels):
-                                resized_mask = np.array(Image.fromarray(combined_mask[:, :, idx_color]).resize(
-                                    (W * st.session_state['subpixel_resolution'],
-                                     H * st.session_state['subpixel_resolution']), resample=Image.NEAREST))
-
-                                # Clear affected pixels first
-                                edited_mask[:, :, d, idx, :][resized_mask > 0] = 0
-                                # Apply current channel
-                                edited_mask[:, :, d, idx, channel][resized_mask > 0] = 1
-
-                        st.session_state['edit_made'] = True
-                        st.rerun()
-
-            with col2:
-                if st.button('Clear Slice', use_container_width=True):
+            with col_clear:
+                if st.button('❌', use_container_width=True):
                     edited_mask[:, :, d, idx, :] = 0
+                    save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
                     st.session_state['edit_made'] = True
                     st.rerun()
 
-            st.session_state[f'edited_mask_{ventricle}'] = edited_mask
+            st.divider()
+            st.caption('Dilation and Erosion')
+            col_expand, col_shrink, _, col_expand_myo, col_shrink_myo = st.columns([1, 1, 1, 1, 1])
 
+            with col_expand:
+                if st.button("🔴" + " :material/north:", use_container_width=True, key="dilate_bp"):
+                    # Step 1: dilate last channel
+                    lv_channel = st.session_state['edited_mask'][:, :, d, idx, lv_idx]
+                    dilated_last = binary_dilation(lv_channel)
+                    edited_mask[:, :, d, idx, lv_myo_idx] = edited_mask[:, :, d, idx, lv_myo_idx] & (~dilated_last)
+                    # Step 3: assign updated last channel
+                    edited_mask[:, :, d, idx, -1] = dilated_last
+                    st.session_state['edit_made'] = True
+                    save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
+                    st.rerun()
+
+            with col_shrink:
+                if st.button("🔴" + " :material/south:", use_container_width=True, key="erode_bp"):
+                    lv_channel = st.session_state['edited_mask'][:, :, d, idx, lv_idx]
+                    eroded_lv = binary_erosion(lv_channel, iterations=1)
+
+                    # ring = original LV minus eroded LV
+                    lv_ring = lv_channel & (~eroded_lv)
+
+                    # add only the ring to myocardium
+                    edited_mask[:, :, d, idx, lv_myo_idx] = (
+                            edited_mask[:, :, d, idx, lv_myo_idx] | lv_ring
+                    )
+
+                    # UPDATE: assign the eroded LV back to the LV channel
+                    edited_mask[:, :, d, idx, lv_idx] = eroded_lv
+
+                    st.session_state['edit_made'] = True
+                    save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
+                    st.rerun()
+
+            with col_expand_myo:
+                if st.button("🔵" + " :material/north:", use_container_width=True, key="dilate_myo"):
+                    # Get epicardium = LV blood pool + myocardium
+                    lv_channel = st.session_state['edited_mask'][:, :, d, idx, lv_idx]
+                    myo_channel = st.session_state['edited_mask'][:, :, d, idx, lv_myo_idx]
+                    epicardium = lv_channel | myo_channel
+
+                    # Dilate epicardium outward
+                    dilated_epi = binary_dilation(epicardium, iterations=1)
+
+                    # New outer ring = dilated epicardium minus original epicardium
+                    outer_ring = dilated_epi & (~epicardium)
+
+                    # Add outer ring to myocardium
+                    edited_mask[:, :, d, idx, lv_myo_idx] = myo_channel | outer_ring
+
+                    st.session_state['edit_made'] = True
+                    save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
+                    st.rerun()
+
+            with col_shrink_myo:
+                if st.button("🔵" + " :material/south:", use_container_width=True, key="erode_myo"):
+                    # Get epicardium = LV blood pool + myocardium
+                    lv_channel = st.session_state['edited_mask'][:, :, d, idx, lv_idx]
+                    myo_channel = st.session_state['edited_mask'][:, :, d, idx, lv_myo_idx]
+                    epicardium = lv_channel | myo_channel
+
+                    # Erode epicardium inward
+                    eroded_epi = binary_erosion(epicardium, iterations=1)
+
+                    # New myocardium = eroded epicardium minus LV blood pool
+                    edited_mask[:, :, d, idx, lv_myo_idx] = eroded_epi & (~lv_channel)
+
+                    st.session_state['edit_made'] = True
+                    save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
+                    st.rerun()
+
+    # ---------- right column preview ----------
     with col3:
-
         view_mode = st.radio(
-            'Corrected Mask',
-            ['Static', 'Viewer'],
-            index=['Static', 'Viewer'].index(st.session_state["view_mode"]),
-            horizontal=True
+            "Corrected Mask",
+            ["Static", "Viewer"],
+            index=0,
+            horizontal=True,
         )
-        st.session_state["view_mode"] = view_mode
 
-        if st.session_state[f'{ventricle}_frames'] is None or st.session_state['edit_made']:
+        if st.session_state.get("edited_frames") is None or st.session_state["edit_made"]:
             make_video(
                 image,
-                st.session_state[f'edited_mask_{ventricle}'],
-                save_file=f'{edited_gif_path}_{ventricle}',
+                edited_mask,
+                save_file=full_edited_gif_path,
                 mask_frames=[dia_idx, sys_idx],
-                ventricle=ventricle
-
             )
-            st.session_state[f'mask_hash_{ventricle}'] = mask_hash(st.session_state[f'edited_mask_{ventricle}'])
-            gif = Image.open(f'{edited_gif_path}_{ventricle}.gif')
-            lv_frames = [frame.copy() for frame in ImageSequence.Iterator(gif)]
-            st.session_state[f'{ventricle}_frames'] = lv_frames
-            st.session_state['edit_made'] = False
+            gif = Image.open(full_edited_gif_path)
+            st.session_state["edited_frames"] = [f.copy() for f in ImageSequence.Iterator(gif)]
+            st.session_state["edit_made"] = False
 
-        if "End-Diastole" in idx_label:
-            view_idx = 0
-        else:
-            view_idx = 1
+        if view_mode == "Static":
+            view_image = st.session_state["edited_frames"][0 if idx_label == "End-Diastole" else 1]
+            width = int(DISPLAY_W * 1.5)
+        elif view_mode == "Viewer":
+            view_image = image_slice
+            width = int(DISPLAY_W)
 
-        if view_mode == 'Viewer':
-            st.image(image_slice, width=DISPLAY_W)
-        elif view_mode == 'Static':
-            st.image(st.session_state[f'{ventricle}_frames'][view_idx])
+        st.image(view_image, width=width)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if os.path.exists(review_list_path):
+                download_review_csv(review_list_path)
+
+        with col2:
+            read_or_create_review_csv(review_list_path, patient=st.session_state['patient'],
+                                      study_date=st.session_state['study_date'],
+                                      sax_series_uid=st.session_state['sax_series_uid'])
+            if os.path.exists(review_list_path):
+                df = pd.read_csv(review_list_path)
+                if st.session_state['sax_series_uid'] in df["sax_series_uid"].values:
+                    st.warning(f"{st.session_state['patient']} | {st.session_state['study_date']} in Review")
