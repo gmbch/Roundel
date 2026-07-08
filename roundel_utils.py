@@ -1065,12 +1065,12 @@ def normalize(image):
     image = (image - np.min(image)) / (np.max(image) - np.min(image))
     return image
 
-# recreate image not canvas
 def mask_editor_view():
     """Efficient Mask Editor with controlled reruns and canvas caching."""
     if not st.session_state.edv_esv_selected["confirmed"]:
         st.error("Select and confirm EDV/ESV first.")
         st.stop()
+
 
     H, W, D, T, N = [st.session_state.preprocessed[k] for k in ["H", "W", "D", "T", "N"]]
     image = st.session_state.preprocessed["smooth_image"]
@@ -1078,7 +1078,125 @@ def mask_editor_view():
     dia_idx = st.session_state.edv_esv_selected["dia_idx"]
     sys_idx = st.session_state.edv_esv_selected["sys_idx"]
 
+
+    # ---------------------------------------------------
+    # CLOUD BACKUP / RESTORE CONTROLS
+    # ---------------------------------------------------
+
+
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([0.22, 0.22, 0.56])
+
+
+    # ---------------------------
+    # LOAD CLOUD BACKUP
+    # ---------------------------
+
+
+    with ctrl_col1:
+
+
+        if (
+                st.session_state.get("remote_checkpoint_available", False)
+                and
+                not st.session_state.get("loaded_remote_checkpoint", False)
+        ):
+
+
+            if st.button(
+                    "☁️ Load Cloud Backup",
+                    type="secondary",
+                    use_container_width=True
+            ):
+
+
+                remote_checkpoint = st.session_state["remote_checkpoint_data"]
+
+
+                st.session_state["edited_mask"] = (
+                    remote_checkpoint["edited_mask"].astype("uint8")
+                )
+
+
+                edited_mask = st.session_state["edited_mask"]
+
+
+                remote_cfg = remote_checkpoint["config"]
+
+
+                if remote_cfg.get("edv_esv_selected"):
+                    st.session_state.edv_esv_selected = (
+                        remote_cfg["edv_esv_selected"]
+                    )
+
+
+                if remote_cfg.get("panel_idx") is not None:
+                    st.session_state["slice_idx"] = (
+                        remote_cfg["panel_idx"]
+                    )
+
+
+                st.session_state["loaded_remote_checkpoint"] = True
+
+
+                save_cached_mask(
+                    st.session_state["edited_mask"],
+                    save_path=st.session_state['cache_mask_path']
+                )
+
+
+                st.success("Cloud backup restored.")
+
+
+                st.rerun()
+
+
+    # ---------------------------
+    # SAVE CLOUD BACKUP
+    # ---------------------------
+
+
+    with ctrl_col2:
+
+
+        if st.button(
+                "💾 Backup Progress",
+                type="secondary",
+                use_container_width=True
+        ):
+            save_intermediate_session(
+                study_uid=st.session_state["sax_series_uid"],
+                edited_mask=st.session_state["edited_mask"],
+                edv_esv_selected=st.session_state["edv_esv_selected"],
+                patient=st.session_state.get("patient"),
+                study_date=st.session_state.get("study_date"),
+                panel_idx=st.session_state.get("slice_idx"),
+            )
+
+
+            st.success("Progress safely stored to cloud.")
+
+
+    # ---------------------------
+    # STATUS TEXT
+    # ---------------------------
+
+
+    with ctrl_col3:
+
+
+        if (
+                st.session_state.get("remote_checkpoint_available", False)
+                and
+                not st.session_state.get("loaded_remote_checkpoint", False)
+        ):
+            st.caption("☁️ Cloud backup detected for this case")
+
+
+    st.divider()
+
+
     col1, col2, col3 = st.columns([1, 1.5, 1.5])
+
 
     with col1:
         channel, action, stroke_width = select_brush(N)
@@ -1086,16 +1204,20 @@ def mask_editor_view():
         idx_label = st.radio("Frame", ["End-Diastole", "End-Systole"], index=0, horizontal=True)
         d, reset_canvas = slice_navigation(D)
 
+
     idx = dia_idx if idx_label == "End-Diastole" else sys_idx
+
 
     # Normalize slice once per display
     img_slice = image[:, :, d, idx]
     image_slice = ((img_slice - img_slice.min()) / (img_slice.max() - img_slice.min()) * 255).astype(np.uint8)
     mask_slice = edited_mask[:, :, d, idx, :]
 
+
     with col2:
         edit_mode = st.radio('Segmentation Editor', ['Editor', 'Viewer'], index=0, horizontal=True)
         stroke_color = f"rgba{OVERLAY_COLORS[background_idx][:3] + (0.8,)}" if action == "Erase ✂️" else f"rgba{OVERLAY_COLORS[channel][:3] + (0.65,)}"
+
 
         if edit_mode == 'Viewer':
             st.image(image_slice, width=DISPLAY_W)
@@ -1117,10 +1239,10 @@ def mask_editor_view():
                 stroke_color=stroke_color,
                 background_image=get_overlay(image_slice, mask_slice, H, W, N, OVERLAY_COLORS),
                 update_streamlit=True,
-                height=DISPLAY_H,
+                height=H * DISPLAY_W / W,
                 width=DISPLAY_W,
                 drawing_mode='freedraw',
-                key='editor',
+                key="editor",  # <-- fixed key
             )
 
             if force_empty:
@@ -1131,11 +1253,13 @@ def mask_editor_view():
 
             canvas_result = st_canvas(**canvas_kwargs)
 
+
             # Track current objects
             current_objects = []
             if canvas_result and canvas_result.json_data:
                 current_objects = canvas_result.json_data.get("objects", [])
             st.session_state['canvas']['previous_objects'] = current_objects
+
 
             # Save / clear buttons (trigger rerun only here)
             col_save, col_clear = st.columns([1, 0.15])
@@ -1146,8 +1270,10 @@ def mask_editor_view():
                     rgb = brush_data[:, :, :3].astype(np.float32)
                     alpha = brush_data[:, :, 3].astype(np.float32) / 255.0
 
+
                     overlay_colors_list = np.array([color[:3] for color in OVERLAY_COLORS.values()], dtype=np.float32)
                     overlay_channels = list(OVERLAY_COLORS.keys())
+
 
                     h, w, _ = rgb.shape
                     rgb_flat = rgb.reshape(-1, 3)
@@ -1155,15 +1281,18 @@ def mask_editor_view():
                     distances = np.linalg.norm(rgb_flat[:, None, :] - overlay_colors_list[None, :, :], axis=-1)
                     closest_idx = np.argmin(distances, axis=1)
 
+
                     mask_flat = np.zeros((h * w, len(overlay_channels)), dtype=np.uint8)
                     for idx_color, ch in enumerate(overlay_channels):
                         mask_flat[:, idx_color] = ((closest_idx == idx_color) & (alpha_flat > 0)).astype(np.uint8)
+
 
                     masks = []
                     for idx_color, ch in enumerate(overlay_channels):
                         mask_bool = mask_flat[:, idx_color].reshape(h, w)
                         mask_bool = thicken_close_fill_and_smooth(mask_bool, stroke_width)
                         masks.append(mask_bool)
+
 
                     combined_mask = np.stack(masks, axis=-1)
                     for idx_color, ch in enumerate(overlay_channels):
@@ -1177,9 +1306,11 @@ def mask_editor_view():
                         edited_mask[:, :, d, idx, :][resized_mask > 0] = 0
                         edited_mask[:, :, d, idx, ch][resized_mask > 0] = 1
 
+
                     st.session_state['edit_made'] = True
                     save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
                     st.rerun()
+
 
             with col_clear:
                 if st.button('❌', use_container_width=True):
@@ -1188,9 +1319,11 @@ def mask_editor_view():
                     st.session_state['edit_made'] = True
                     st.rerun()
 
+
             st.divider()
             st.caption('Dilation and Erosion')
             col_expand, col_shrink, _, col_expand_myo, col_shrink_myo = st.columns([1, 1, 1, 1, 1])
+
 
             with col_expand:
                 if st.button("🔴" + " :material/north:", use_container_width=True, key="dilate_bp"):
@@ -1204,25 +1337,31 @@ def mask_editor_view():
                     save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
                     st.rerun()
 
+
             with col_shrink:
                 if st.button("🔴" + " :material/south:", use_container_width=True, key="erode_bp"):
                     lv_channel = st.session_state['edited_mask'][:, :, d, idx, lv_idx]
                     eroded_lv = binary_erosion(lv_channel, iterations=1)
 
+
                     # ring = original LV minus eroded LV
                     lv_ring = lv_channel & (~eroded_lv)
+
 
                     # add only the ring to myocardium
                     edited_mask[:, :, d, idx, lv_myo_idx] = (
                             edited_mask[:, :, d, idx, lv_myo_idx] | lv_ring
                     )
 
+
                     # UPDATE: assign the eroded LV back to the LV channel
                     edited_mask[:, :, d, idx, lv_idx] = eroded_lv
+
 
                     st.session_state['edit_made'] = True
                     save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
                     st.rerun()
+
 
             with col_expand_myo:
                 if st.button("🔵" + " :material/north:", use_container_width=True, key="dilate_myo"):
@@ -1231,18 +1370,23 @@ def mask_editor_view():
                     myo_channel = st.session_state['edited_mask'][:, :, d, idx, lv_myo_idx]
                     epicardium = lv_channel | myo_channel
 
+
                     # Dilate epicardium outward
                     dilated_epi = binary_dilation(epicardium, iterations=1)
+
 
                     # New outer ring = dilated epicardium minus original epicardium
                     outer_ring = dilated_epi & (~epicardium)
 
+
                     # Add outer ring to myocardium
                     edited_mask[:, :, d, idx, lv_myo_idx] = myo_channel | outer_ring
+
 
                     st.session_state['edit_made'] = True
                     save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
                     st.rerun()
+
 
             with col_shrink_myo:
                 if st.button("🔵" + " :material/south:", use_container_width=True, key="erode_myo"):
@@ -1251,15 +1395,19 @@ def mask_editor_view():
                     myo_channel = st.session_state['edited_mask'][:, :, d, idx, lv_myo_idx]
                     epicardium = lv_channel | myo_channel
 
+
                     # Erode epicardium inward
                     eroded_epi = binary_erosion(epicardium, iterations=1)
+
 
                     # New myocardium = eroded epicardium minus LV blood pool
                     edited_mask[:, :, d, idx, lv_myo_idx] = eroded_epi & (~lv_channel)
 
+
                     st.session_state['edit_made'] = True
                     save_cached_mask(edited_mask, save_path=st.session_state['cache_mask_path'])
                     st.rerun()
+
 
     # ---------- right column preview ----------
     with col3:
@@ -1269,6 +1417,7 @@ def mask_editor_view():
             index=0,
             horizontal=True,
         )
+
 
         if st.session_state.get("edited_frames") is None or st.session_state["edit_made"]:
             make_video(
@@ -1281,6 +1430,7 @@ def mask_editor_view():
             st.session_state["edited_frames"] = [f.copy() for f in ImageSequence.Iterator(gif)]
             st.session_state["edit_made"] = False
 
+
         if view_mode == "Static":
             view_image = st.session_state["edited_frames"][0 if idx_label == "End-Diastole" else 1]
             width = int(DISPLAY_W * 1.5)
@@ -1288,12 +1438,15 @@ def mask_editor_view():
             view_image = image_slice
             width = int(DISPLAY_W)
 
+
         st.image(view_image, width=width)
+
 
         col1, col2 = st.columns(2)
         with col1:
             if os.path.exists(review_list_path):
                 download_review_csv(review_list_path)
+
 
         with col2:
             read_or_create_review_csv(review_list_path, patient=st.session_state['patient'],
@@ -1303,3 +1456,5 @@ def mask_editor_view():
                 df = pd.read_csv(review_list_path)
                 if st.session_state['sax_series_uid'] in df["sax_series_uid"].values:
                     st.warning(f"{st.session_state['patient']} | {st.session_state['study_date']} in Review")
+
+
