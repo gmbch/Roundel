@@ -1,4 +1,5 @@
 import os, sys
+import importlib.util
 import glob
 import math
 import hashlib
@@ -73,6 +74,35 @@ OVERLAY_COLORS = {
     lv_myo_idx: LV_MYO_COLOR,
     lv_idx: LV_COLOR,
 }
+
+
+_ADVANCED_UTILS = None
+
+
+def _load_advanced_utils():
+    """Load only the isolated 3D/4D renderers from the prospective utility file."""
+    global _ADVANCED_UTILS
+    if _ADVANCED_UTILS is not None:
+        return _ADVANCED_UTILS
+
+    candidate_path = Path(__file__).parent / "roundel-vMW-2" / "roundel_utils.py"
+    spec = importlib.util.spec_from_file_location(
+        "roundel_vmw_advanced_utils", candidate_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load advanced renderers from {candidate_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _ADVANCED_UTILS = module
+    return module
+
+
+def _render_advanced_view(view_mode, edited_mask, idx, idx_label):
+    advanced = _load_advanced_utils()
+    if view_mode == "3D":
+        advanced._render_lv_3d(edited_mask, idx, idx_label)
+    else:
+        advanced._render_lv_4d()
 
 
 def cleanup_case_artifacts(study_uid, local_dir=None):
@@ -1413,7 +1443,7 @@ def mask_editor_view():
     with col3:
         view_mode = st.radio(
             "Corrected Mask",
-            ["Static", "Viewer"],
+            ["Static", "Viewer", "3D", "4D", "4CH Reference"],
             index=0,
             horizontal=True,
         )
@@ -1437,9 +1467,28 @@ def mask_editor_view():
         elif view_mode == "Viewer":
             view_image = image_slice
             width = int(DISPLAY_W)
+        elif view_mode in ("3D", "4D"):
+            try:
+                _render_advanced_view(view_mode, edited_mask, idx, idx_label)
+                view_image = None
+            except Exception as exc:
+                st.error(f"Could not render the {view_mode} corrected-mask view: {exc}")
+                view_image = image_slice
+                width = int(DISPLAY_W)
+        elif view_mode == "4CH Reference":
+            from fourc_viewer import render_4ch_alignment
 
+            aligned = render_4ch_alignment(
+                slice_idx=d,
+                sax_frame=idx,
+                sax_nframes=T,
+                local_dir=st.session_state["data_path"],
+            )
+            view_image = image_slice if not aligned else None
+            width = int(DISPLAY_W)
 
-        st.image(view_image, width=width)
+        if view_image is not None:
+            st.image(view_image, width=width)
 
 
         col1, col2 = st.columns(2)
@@ -1456,5 +1505,3 @@ def mask_editor_view():
                 df = pd.read_csv(review_list_path)
                 if st.session_state['sax_series_uid'] in df["sax_series_uid"].values:
                     st.warning(f"{st.session_state['patient']} | {st.session_state['study_date']} in Review")
-
-

@@ -5,8 +5,11 @@ from roundel_utils import *
 from aws_utils import (
     fetch_staged_roundel_cases,
     download_sax_artifacts,
-    save_masks_and_metrics
+    save_masks_and_metrics,
+    delete_intermediate_session,
+    build_ambra_link,
 )
+from fourc_viewer import render_4c_review
 
 st.set_page_config(page_title="Roundel", page_icon="⭕️", layout='wide')
 
@@ -32,11 +35,33 @@ with col1:
     #     options=cases,
     #     format_func=lambda c: f"{c.get('fid','Unknown')} | {c.get('study_date','Unknown')} | {c.get('study_uid')}"
     # )
+
+    # ---------------------------------------------------
+    # DETERMINE CURRENT SELECTED INDEX
+    # ---------------------------------------------------
+
+    selected_uid = st.session_state.get(
+        "selected_study_uid",
+        cases[0]["study_uid"]
+    )
+
+    case_uids = [c["study_uid"] for c in cases]
+
+    selected_index = (
+        case_uids.index(selected_uid)
+        if selected_uid in case_uids
+        else 0
+    )
+
     selected_case = st.selectbox(
         "Select Case",
         options=cases,
-        index=cases.index(st.session_state.get("selected_case", cases[0])),
+        index=selected_index,
         format_func=lambda c: f"{c.get('fid', 'Unknown')} | {c.get('study_date', 'Unknown')}"
+    )
+
+    st.session_state["selected_study_uid"] = (
+        selected_case["study_uid"]
     )
 
     st.session_state["selected_case"] = selected_case
@@ -59,6 +84,37 @@ if not gif_url.startswith("http"):
 
 comments  = case_item.get("comments")
 description = case_item.get("description", "Unknown")
+try:
+    ambra_link = build_ambra_link(study_uid)
+except Exception as exc:
+    ambra_link = None
+    ambra_link_error = str(exc)
+site_code = str(case_item.get("site", "") or "").strip().upper()
+if not site_code:
+    site_code = str(patient or "").strip()[:3].upper()
+
+stored_4c_uid = case_item.get("selected_4c_series_uid")
+session_4c_uid = st.session_state.get("fourc_selected_series_uid")
+session_4c_study_uid = st.session_state.get("fourc_selection_study_uid")
+fourc_series_uid = (
+    session_4c_uid
+    if session_4c_uid and session_4c_study_uid == study_uid
+    else stored_4c_uid
+)
+fourc_description = (
+    st.session_state.get("fourc_selected_description", "")
+    if session_4c_uid == fourc_series_uid and session_4c_study_uid == study_uid
+    else case_item.get("selected_4c_description", "")
+)
+fourc_selection_confirmed = bool(
+    fourc_series_uid and (
+        case_item.get("fourc_selection_confirmed", True)
+        or (session_4c_uid == fourc_series_uid and session_4c_study_uid == study_uid)
+    )
+)
+fourc_unavailable = (
+    st.session_state.get("fourc_unavailable_study_uid") == study_uid
+)
 
 pixelspacing = float(case_item["pixelspacing"])
 thickness    = float(case_item["thickness"])
@@ -67,22 +123,38 @@ thickness    = float(case_item["thickness"])
 # --------------------------------------------------------------
 # Download artifacts from S3
 # --------------------------------------------------------------
-local_dir = download_sax_artifacts(study_uid, saxdf_bool=False, model_ind=model_ind)
+local_dir = download_sax_artifacts(study_uid, saxdf_bool=True, model_ind=model_ind)
 
 sax_series_uid_list = get_sax_series_uid_list(local_dir)
 
 # Initialize Roundel logic
 initialize_app(local_dir, patient, study_date, study_uid, pixelspacing, thickness,  preprocess=True)
+st.session_state["fourc_selected_series_uid"] = fourc_series_uid
+st.session_state["fourc_selection_study_uid"] = study_uid
+st.session_state["fourc_selection_confirmed"] = fourc_selection_confirmed
+st.session_state["fourc_site_code"] = site_code
 # --------------------------------------------------------------
 # Display sidebar metadata
 # --------------------------------------------------------------
 with col2:
     # Display metadata in the app
     st.markdown(f"**🟢 {len(cases)} total staged cases**")
-    st.markdown(f"**Study UID:** {study_uid} | **FID:** {patient} | **Study Date:** {study_date} | **2D or 4D:** {model_ind}")
+    st.markdown(f"**Study UID:** {study_uid} | **FID:** {patient} | **Study Date:** {study_date} | **Site:** {site_code} | **2D or 4D:** {model_ind}")
     st.markdown(f"**Flags from SageMaker:** {sagemaker_flags}")
     st.markdown(f"**SageMaker Comments:** {comments}")
     st.markdown(f"**Description:** {description} | **Pixel Size**: {pixelspacing} x {pixelspacing}mm | **Slice Thickness**: {thickness} mm")
+    if ambra_link:
+        st.markdown(f"[Open study in Ambra]({ambra_link})")
+    else:
+        st.caption(f"Ambra study link unavailable: {ambra_link_error}")
+    if fourc_selection_confirmed:
+        st.success(f"4C selected: `{fourc_series_uid}`")
+    elif fourc_unavailable:
+        st.info("No usable 4C series are available; continuing without 4C tools.")
+
+    if case_item.get("checkpoint_exists"):
+        st.warning("💾 Recoverable draft session exists")
+
     st.markdown(f"**Pipeline: EDV**: {pipeline_edv:.1f} mL | **ESV**: {pipeline_esv:.1f} mL | **Mass**: {pipeline_mass:.1f} g")
     st.markdown(f"[📥 Download Segmentation GIF]({gif_url})")
 
@@ -107,15 +179,33 @@ with col2:
 # App
 # --------------------------------------------------------------
 
+available_views = ["4C Viewer 🫀", "EDV/ESV Finder 🔍", "Mask Editor 📝", "Final Result ✅"]
+requested_view = st.session_state.pop("next_view", None)
+if st.session_state.get("roundel_view_study_uid") != study_uid:
+    st.session_state["roundel_view_study_uid"] = study_uid
+    st.session_state["roundel_view"] = "4C Viewer 🫀"
+if requested_view in available_views:
+    st.session_state["roundel_view"] = requested_view
+
 view = st.segmented_control(
     "Tab",
-    options=["EDV/ESV Finder 🔍", "Mask Editor 📝", "Final Result ✅"],
-    default = "EDV/ESV Finder 🔍",
+    options=available_views,
+    key="roundel_view",
     label_visibility='hidden'
 )
 st.divider()
 
 # --------------------------------------------------------------
+# 4C Viewer
+# --------------------------------------------------------------
+if view == "4C Viewer 🫀":
+    selected_4c_uid = render_4c_review(study_uid, site_code, case_item)
+    if selected_4c_uid:
+        st.session_state["fourc_selected_series_uid"] = selected_4c_uid
+        st.session_state["fourc_selection_study_uid"] = study_uid
+        st.session_state["fourc_selection_confirmed"] = True
+        st.info("4C selection is complete. Open the Mask Editor when ready.")
+
 # EDV/ESV Finder
 # --------------------------------------------------------------
 if view == "EDV/ESV Finder 🔍":
@@ -127,16 +217,19 @@ if view == "EDV/ESV Finder 🔍":
 
 
 if view == "Mask Editor 📝":
-    # try:
+    if not fourc_selection_confirmed and not fourc_unavailable:
+        st.error("Complete and confirm the 4C Viewer selection first.")
+        st.stop()
     mask_editor_view()
-    # except:
-    #     st.rerun()
 
 # --------------------------------------------------------------
 # Final Result
 # --------------------------------------------------------------
 
 if view == "Final Result ✅":
+    if not fourc_selection_confirmed and not fourc_unavailable:
+        st.error("Complete and confirm the 4C Viewer selection first.")
+        st.stop()
     raw = st.session_state.raw
     preprocessed = st.session_state.preprocessed
 
@@ -221,8 +314,12 @@ if view == "Final Result ✅":
                 patient=patient,
                 study_date=study_date,
                 description=description,
-                model_ind=model_ind
+                model_ind=model_ind,
+                fourc_series_uid=fourc_series_uid,
+                fourc_description=fourc_description
             )
+
+            delete_intermediate_session(study_uid)
 
             cleanup_case_artifacts(
                 study_uid=study_uid,
@@ -247,7 +344,11 @@ if view == "Final Result ✅":
             reset_keys = [
                 "edited_mask", "edv_esv_selected", "preprocessed", "raw",
                 "edited_frames", "mask_hash", "cache_config_path", "cache_mask_path",
-                "point1", "point2", "coord1", "coord2", "crop1", "crop2"
+                "point1", "point2", "coord1", "coord2", "crop1", "crop2",
+                "fourc_selected_series_uid", "fourc_selection_study_uid",
+                "fourc_selection_confirmed", "fourc_candidate_series_uid",
+                "fourc_candidate_study_uid", "fourc_selected_description",
+                "fourc_unavailable_study_uid"
             ]
 
             for k in reset_keys:
@@ -264,6 +365,10 @@ if view == "Final Result ✅":
             # Select the next case automatically
             # ----------------------------------------------------------
             st.session_state["selected_case"] = new_cases[0]
+
+            st.session_state["selected_study_uid"] = (
+                new_cases[0]["study_uid"]
+            )
 
             # Set tab for the NEXT run
             st.session_state["next_view"] = "EDV/ESV Finder 🔍"

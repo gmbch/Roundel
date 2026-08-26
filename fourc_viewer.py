@@ -292,7 +292,7 @@ def render_4c_review(study_uid, site_code, case_item):
             st.session_state["fourc_candidate_series_uid"] = selected_uid
             st.session_state["fourc_candidate_study_uid"] = study_uid
     except (ImportError, TypeError, ValueError):
-        st.info("Install `streamlit-image-select` for direct image clicks; use the buttons below otherwise.")
+        st.info("Select a preview using the buttons below.")
         columns = st.columns(5)
         for index, row in enumerate(preview_rows):
             uid = row["series-uid"]
